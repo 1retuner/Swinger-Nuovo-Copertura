@@ -1994,9 +1994,9 @@ void CTradeManager::ManagePositions(const CLevelManager &levels, CDataCache &cac
          int _hsi = FindStateIndex(ticket);
          if(_hsi >= 0)
          {
+            double levelBuf = LevelBufferPoints * g_point; // necessario in questo scope
             // Recupera il livello hedge (L+1) dalla posizione corrente
-            // slLevelPrice è locale, usiamo l'SL attuale come riferimento
-            // Il trigger del hedge è tra entry e SL (approssimato al livello più vicino)
+            // Il trigger del hedge è il primo livello dal lato perdente rispetto all'entry
             double hTrigger = 0.0;
             if(dir == DIR_SELL)
             {
