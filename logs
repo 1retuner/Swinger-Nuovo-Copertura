@@ -1,0 +1,37 @@
+2026.03.13 22:37:21.737	2026.03.09 01:30:00   [INF] 01:29:59 | TIMER | Loaded 10 levels for 2026-03-09
+2026.03.13 22:37:21.745	2026.03.09 01:30:00   market buy 0.6 XAUUSD sl: 5108.70 tp: 5254.31 (5155.61 / 5155.92)
+2026.03.13 22:37:21.745	2026.03.09 01:30:00   deal #2 buy 0.6 XAUUSD at 5155.92 done (based on order #2)
+2026.03.13 22:37:21.745	2026.03.09 01:30:00   deal performed [#2 buy 0.6 XAUUSD at 5155.92]
+2026.03.13 22:37:21.745	2026.03.09 01:30:00   order performed buy 0.6 at 5155.92 [#2 buy 0.6 XAUUSD at 5155.92]
+2026.03.13 22:37:21.747	2026.03.09 01:30:00   CTrade::OrderSend: market buy 0.60 XAUUSD sl: 5108.70 tp: 5254.31 [done at 5155.92]
+2026.03.13 22:37:21.747	2026.03.09 01:30:00   [INF] 01:30:00 | OPEN | Open BUY #2: entry=5155.92 anchorLvl=5168.78 T1=5198.30 T2=5226.30 T3=5254.31 SL=5108.70 TP=5254.31
+2026.03.13 22:37:21.747	2026.03.09 01:30:00   [INF] 01:30:00 | HEDGE | PlaceHedgeOrder CALLED: dir=BUY trigger=5140.78 lots=0.60 enabled=YES
+2026.03.13 22:37:21.752	2026.03.09 01:30:00   sell stop 0.6 XAUUSD at 5140.78 sl: 5143.78 (5155.75 / 5156.06)
+2026.03.13 22:37:21.754	2026.03.09 01:30:00   CTrade::OrderSend: sell stop 0.60 XAUUSD at 5140.78 sl: 5143.78 [done]
+2026.03.13 22:37:21.754	2026.03.09 01:30:00   [INF] 01:30:00 | HEDGE | PlaceHedgeOrder OK: SELL STOP #3 trigger=5140.78 lots=0.60 SL=5143.78
+2026.03.13 22:37:28.712	2026.03.09 01:36:00   market buy 0.6 XAUUSD sl: 5108.70 tp: 5226.30 (5144.77 / 5145.08)
+2026.03.13 22:37:28.712	2026.03.09 01:36:00   deal #3 buy 0.6 XAUUSD at 5145.08 done (based on order #4)
+2026.03.13 22:37:28.712	2026.03.09 01:36:00   deal performed [#3 buy 0.6 XAUUSD at 5145.08]
+2026.03.13 22:37:28.712	2026.03.09 01:36:00   order performed buy 0.6 at 5145.08 [#4 buy 0.6 XAUUSD at 5145.08]
+2026.03.13 22:37:28.714	2026.03.09 01:36:00   CTrade::OrderSend: market buy 0.60 XAUUSD sl: 5108.70 tp: 5226.30 [done at 5145.08]
+2026.03.13 22:37:28.714	2026.03.09 01:36:00   [INF] 01:36:00 | OPEN | Open BUY #4: entry=5145.08 anchorLvl=5140.78 T1=5168.78 T2=5198.30 T3=5226.30 SL=5108.70 TP=5226.30
+2026.03.13 22:37:28.714	2026.03.09 01:36:00   [INF] 01:36:00 | HEDGE | PlaceHedgeOrder CALLED: dir=BUY trigger=5140.78 lots=0.60 enabled=YES
+2026.03.13 22:37:28.719	2026.03.09 01:36:00   sell stop 0.6 XAUUSD at 5140.78 sl: 5143.78 (5144.75 / 5145.05)
+2026.03.13 22:37:28.723	2026.03.09 01:36:00   CTrade::OrderSend: sell stop 0.60 XAUUSD at 5140.78 sl: 5143.78 [done]
+2026.03.13 22:37:28.723	2026.03.09 01:36:00   [INF] 01:36:00 | HEDGE | PlaceHedgeOrder OK: SELL STOP #5 trigger=5140.78 lots=0.60 SL=5143.78
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   order [#3 sell stop 0.6 XAUUSD at 5140.78] triggered
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   deal #4 sell 0.6 XAUUSD at 5140.05 done (based on order #3)
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   deal performed [#4 sell 0.6 XAUUSD at 5140.05]
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   order performed sell 0.6 at 5140.05 [#3 sell stop 0.6 XAUUSD at 5140.78]
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   order [#5 sell stop 0.6 XAUUSD at 5140.78] triggered
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   deal #5 sell 0.6 XAUUSD at 5140.05 done (based on order #5)
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   deal performed [#5 sell 0.6 XAUUSD at 5140.05]
+2026.03.13 22:37:29.140	2026.03.09 01:36:18   order performed sell 0.6 at 5140.05 [#5 sell stop 0.6 XAUUSD at 5140.78]
+2026.03.13 22:37:30.951	2026.03.09 01:37:56   stop loss triggered #3 sell 0.6 XAUUSD 5140.05 sl: 5143.78 [#6 buy 0.6 XAUUSD at 5143.78]
+2026.03.13 22:37:30.952	2026.03.09 01:37:56   deal #6 buy 0.6 XAUUSD at 5143.92 done (based on order #6)
+2026.03.13 22:37:30.952	2026.03.09 01:37:56   deal performed [#6 buy 0.6 XAUUSD at 5143.92]
+2026.03.13 22:37:30.952	2026.03.09 01:37:56   order performed buy 0.6 at 5143.92 [#6 buy 0.6 XAUUSD at 5143.78]
+2026.03.13 22:37:30.952	2026.03.09 01:37:56   stop loss triggered #5 sell 0.6 XAUUSD 5140.05 sl: 5143.78 [#7 buy 0.6 XAUUSD at 5143.78]
+2026.03.13 22:37:30.952	2026.03.09 01:37:56   deal #7 buy 0.6 XAUUSD at 5143.92 done (based on order #7)
+2026.03.13 22:37:30.952	2026.03.09 01:37:56   deal performed [#7 buy 0.6 XAUUSD at 5143.92]
+2026.03.13 22:37:30.952	2026.03.09 01:37:56   order performed buy 0.6 at 5143.92 [#7 buy 0.6 XAUUSD at 5143.78]
