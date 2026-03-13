@@ -1,0 +1,3222 @@
+//+------------------------------------------------------------------+
+//|                                    EnariaLevelSwinger_v3.03.mq5  |
+//|                        BUGFIX: SL dinamico + TP recovery         |
+//|                                                                    |
+//|  FIX 1: SL si sposta su T1 appena supera T2 (non a metà strada)  |
+//|  FIX 2: SL si sposta su T2 appena supera T3 (non a metà strada)  |
+//|  FIX 3: TP sempre su T3 all'apertura (non riscritto da Manage)   |
+//|  FIX 4: Recupero TP per posizioni orfane (no TP, data precedente) |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "3.03"
+#property description "EnariaLevelSwinger v3.03 - SL/TP Bugfix"
+
+#include <Trade/Trade.mqh>
+
+// ============================== ENUMS ================================
+enum ENUM_LOG_LEVEL { LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3 };
+enum ENUM_MM_MODE { MM_FIXED = 0, MM_PERCENT_RISK = 1, MM_KELLY_HALF = 2 };
+enum ENUM_SIGNAL_SETUP { SETUP_NONE = 0, SETUP_REJECTION = 1, SETUP_DIVERGENCE = 2 };
+enum ENUM_DIR { DIR_NONE = 0, DIR_BUY = 1, DIR_SELL = -1 };
+
+// ============================== INPUTS ===============================
+input group "=== GENERAL ==="
+input long                InpMagicNumber                = 26030903;
+input ENUM_TIMEFRAMES     InpSignalTF                   = PERIOD_M15;
+input int                 InpTimerSeconds               = 30;
+input ENUM_LOG_LEVEL      InpLogLevel                   = LOG_ERROR;
+input bool                InpVisualAlerts               = false;
+input bool                EnableLogs                    = true;
+input bool                EnableTradeDrawing            = false;
+input bool                EnableRSIWindow               = false; // Mostra sottofinestra RSI con MA, crossover e divergenze
+
+input group "=== SETUP TOGGLES ==="
+input bool                UseSetup_RejectionMomentum    = true;
+input bool                UseSetup_DivergenceReversal   = true;
+
+input group "=== TRADING DIRECTION ==="
+input bool                AllowBuy                      = true;
+input bool                AllowSell                     = true;
+input bool                HedgingOnly                   = true;
+input bool                ReversalMode                  = false;
+
+input group "=== MONEY MANAGEMENT ==="
+input ENUM_MM_MODE        InpMMMode                     = MM_FIXED;
+input double              InpFixedLots                  = 0.05;
+input double              InpRiskPercent                = 1.0;
+input double              InpKellyWinRate               = 0.55;
+input double              InpKellyPayoff                = 1.5;
+input int                 SlippagePoints                = 30;
+input int                 MaxSimultaneousTrades         = 20;
+input int                 MaxTradesPerBar               = 4;
+
+input group "=== LEVELS & BUFFERS ==="
+input double              LevelNearPct                  = 20.0;
+input double              LevelBufferPoints             = 100.0;
+input double              TouchBufferPoints             = 60.0;
+input double              MinInitialSLPoints            = 500.0;
+input bool                UseLevelCloseFilter           = false;
+input bool                DrawLevelsOnChart             = false;
+input color               LevelColor                    = clrAqua;
+input int                 LevelWidth                    = 1;
+input ENUM_LINE_STYLE     LevelStyle                    = STYLE_SOLID;
+input bool                DrawTradeDetails              = false;
+
+input group "=== BREAKEVEN SETTINGS ==="
+input double              BreakevenBufferPoints         = 20.0;
+
+input group "=== FILTERS ==="
+input int                 MaxSpreadPoints               = 0;
+input bool                UseATRFilter                  = false;
+input double              ATRMin                        = 0.0;
+input double              ATRMax                        = 0.0;
+
+input group "=== RSI SETTINGS ==="
+input int                 RSI_Period                    = 14;
+input int                 RSI_MA_Period                 = 14;
+input int                 RSI_OB                        = 70;
+input int                 RSI_OS                        = 30;
+
+input group "=== REJECTION SETUP ==="
+input int                 RejLookbackBars              = 12;
+input int                 RejMinFailedAttempts         = 1;
+input int                 RejMaxFailedAttempts         = 2;
+input int                 RejMinRSITrendBars           = 1;
+input bool                RejRequireCurrentBarNearLvl  = true;
+
+input group "=== DIVERGENCE SETUP ==="
+input int                 PivotLeftBars                = 2;
+input int                 PivotRightBars               = 2;
+input int                 PivotScanBars                = 200;
+input int                 MinSwingDistanceBars         = 6;
+input int                 MaxSwingDistanceBars         = 20;
+input double              MinPriceSwingDiff            = 0.80;
+input double              MinRSISwingDiff              = 2.50;
+input int                 DivRecentValidityBars        = 8;
+
+input group "=== EQUITY TP ==="
+input bool                UseEquityTP                  = false;
+input double              EquityTPPercent              = 20.0;
+
+input group "=== PROTEZIONE APERTURA ==="
+input int                 GracePeriodMinutes           = 15;    // Minuti dopo apertura in cui non scattano emergency close e trailing
+input double              MinProfitForEmergencyClose   = 0.0;   // Profitto minimo ($) per attivare emergency close (0=disabilitato)
+
+input group "=== POSITION MANAGEMENT ==="
+input bool                UsePartialCloseAtTarget1     = true;
+input double              PartialClosePercent          = 50.0;
+input bool                UseATRTrailing               = true;
+input int                 ATR_Period                   = 14;
+input ENUM_TIMEFRAMES     ATR_TF                       = PERIOD_M15;
+input double              ATR_TrailMult                = 1.50;
+input bool                UseOppositeDivergenceExit    = true;
+
+input group "=== HEDGE PROTECTION ==="
+input bool                UseHedgeProtection           = false;  // Usa BUY/SELL STOP come paracadute invece dello SL classico
+input double              HedgeSLPoints                = 500.0;  // SL del hedge order (punti SOTTO trigger per BUY STOP, SOPRA per SELL STOP)
+input double              HedgeMinProfitPoints         = 0.0;    // Punti minimo profitto per chiudere hedge a BE (0=BE esatto)
+
+// ============================== STRUCTS ==============================
+struct SignalResult
+{
+   bool        valid;
+   ENUM_DIR    dir;
+   ENUM_SIGNAL_SETUP setup;
+   int         anchorIdx;
+   string      reason;
+   
+   SignalResult() : valid(false), dir(DIR_NONE), setup(SETUP_NONE), 
+                    anchorIdx(-1), reason("") {}
+};
+
+struct DivergenceSignal
+{
+   bool        found;
+   ENUM_DIR    dir;
+   int         pivotOlder;
+   int         pivotRecent;
+   double      priceOlder;
+   double      priceRecent;
+   double      rsiOlder;
+   double      rsiRecent;
+   int         levelIdx;
+   
+   DivergenceSignal() : found(false), dir(DIR_NONE), pivotOlder(0), 
+                        pivotRecent(0), priceOlder(0), priceRecent(0),
+                        rsiOlder(0), rsiRecent(0), levelIdx(-1) {}
+};
+
+struct TradeState
+{
+   ulong       ticket;
+   bool        partialDone;
+   bool        target1Hit;
+   bool        target2Hit;   // FIX: aggiunto target2Hit per tracciare T2
+   bool        breakevenDone;
+   datetime    openTime;
+   ulong       hedgeTicket;  // HEDGE: ticket del pending order associato (0=nessuno)
+   
+   TradeState() : ticket(0), partialDone(false), target1Hit(false), target2Hit(false),
+                  breakevenDone(false), openTime(0), hedgeTicket(0) {}
+   TradeState(ulong t) : ticket(t), partialDone(false), target1Hit(false), target2Hit(false),
+                         breakevenDone(false), openTime(TimeCurrent()), hedgeTicket(0) {}
+};
+
+struct PerformanceStats
+{
+   datetime    startTime;
+   int         totalSignals;
+   int         tradesOpened;
+   int         tradesClosed;
+   double      grossProfit;
+   double      grossLoss;
+   double      maxDrawdown;
+   double      maxDrawdownPct;
+   double      peakEquity;
+   
+   PerformanceStats() : startTime(0), totalSignals(0), tradesOpened(0),
+                        tradesClosed(0), grossProfit(0), grossLoss(0),
+                        maxDrawdown(0), maxDrawdownPct(0), peakEquity(0) {}
+                        
+   void UpdateEquity()
+   {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(equity > peakEquity || peakEquity == 0) 
+         peakEquity = equity;
+      
+      double dd = peakEquity - equity;
+      if(dd > maxDrawdown) 
+      {
+         maxDrawdown = dd;
+         maxDrawdownPct = (peakEquity > 0 ? dd / peakEquity * 100 : 0);
+      }
+   }
+   
+   void PrintReport()
+   {
+      Print("=== EnariaLevelSwinger Performance Report ===");
+      Print("Start Time: ", TimeToString(startTime, TIME_DATE|TIME_SECONDS));
+      Print("Total Signals: ", totalSignals);
+      Print("Trades Opened: ", tradesOpened);
+      Print("Trades Closed: ", tradesClosed);
+      Print("Gross Profit: $", DoubleToString(grossProfit, 2));
+      Print("Gross Loss: $", DoubleToString(grossLoss, 2));
+      Print("Net P/L: $", DoubleToString(grossProfit - grossLoss, 2));
+      Print("Max Drawdown: $", DoubleToString(maxDrawdown, 2), " (", DoubleToString(maxDrawdownPct, 2), "%)");
+      
+      if(tradesClosed > 0)
+      {
+         double totalPnL = grossProfit + grossLoss;
+         if(totalPnL > 0)
+         {
+            double winRate = (grossProfit / totalPnL) * 100.0;
+            Print("Win Rate: ", DoubleToString(winRate, 2), "%");
+         }
+         double avgTrade = (grossProfit - grossLoss) / tradesClosed;
+         Print("Average Trade: $", DoubleToString(avgTrade, 2));
+      }
+      Print("=============================================");
+   }
+};
+
+// ============================== CLASSES ==============================
+class CDataCache
+{
+private:
+   MqlRates    m_rates[];
+   double      m_rsi[];
+   double      m_rsiMa[];
+   double      m_atr[];
+   datetime    m_lastRatesTime;
+   datetime    m_lastRSITime;
+   datetime    m_lastATRTime;
+   int         m_rsiHandle;
+   int         m_atrHandle;
+   int         m_lastRatesCount;
+   
+public:
+   CDataCache() : m_lastRatesTime(0), m_lastRSITime(0), m_lastATRTime(0),
+                  m_rsiHandle(INVALID_HANDLE), m_atrHandle(INVALID_HANDLE),
+                  m_lastRatesCount(0) {}
+   
+   bool Init()
+   {
+      m_rsiHandle = iRSI(_Symbol, InpSignalTF, RSI_Period, PRICE_CLOSE);
+      if(m_rsiHandle == INVALID_HANDLE) return false;
+      
+      // Se ATR_TF < InpSignalTF, il Strategy Tester sintetizza le barre del TF
+      // inferiore in modo non deterministico (dipende dalle posizioni aperte).
+      // Forziamo ATR_TF a InpSignalTF come minimo per garantire coerenza.
+      ENUM_TIMEFRAMES effectiveATRTF = ATR_TF;
+      if(ATR_TF != PERIOD_CURRENT && ATR_TF < InpSignalTF)
+      {
+         effectiveATRTF = (ENUM_TIMEFRAMES)InpSignalTF;
+         PrintFormat("[WARN] ATR_TF (%d) < InpSignalTF (%d): forzato a InpSignalTF per evitare valori non deterministici nel tester", ATR_TF, InpSignalTF);
+      }
+      m_atrHandle = iATR(_Symbol, effectiveATRTF, ATR_Period);
+      if(m_atrHandle == INVALID_HANDLE)
+      {
+         IndicatorRelease(m_rsiHandle);
+         return false;
+      }
+      return true;
+   }
+   
+   void Release()
+   {
+      if(m_rsiHandle != INVALID_HANDLE) { IndicatorRelease(m_rsiHandle); m_rsiHandle = INVALID_HANDLE; }
+      if(m_atrHandle != INVALID_HANDLE) { IndicatorRelease(m_atrHandle); m_atrHandle = INVALID_HANDLE; }
+      ArrayFree(m_rates);
+      ArrayFree(m_rsi);
+      ArrayFree(m_rsiMa);
+      ArrayFree(m_atr);
+   }
+   
+   bool GetRates(int needed, MqlRates &outRates[])
+   {
+      datetime t0 = iTime(_Symbol, InpSignalTF, 0);
+      if(t0 == m_lastRatesTime && m_lastRatesCount >= needed)
+      {
+         ArrayCopy(outRates, m_rates);
+         ArraySetAsSeries(outRates, true);
+         return true;
+      }
+      
+      ArrayResize(m_rates, 0);
+      int copied = CopyRates(_Symbol, InpSignalTF, 0, needed, m_rates);
+      if(copied <= 0) return false;
+      
+      ArraySetAsSeries(m_rates, true);
+      m_lastRatesTime = t0;
+      m_lastRatesCount = copied;
+      ArrayCopy(outRates, m_rates);
+      return true;
+   }
+   
+   bool GetRSIData(int needed, double &outRSI[], double &outRSIMa[])
+   {
+      datetime t0 = iTime(_Symbol, InpSignalTF, 0);
+      if(t0 == m_lastRSITime && (int)ArraySize(m_rsi) >= needed + RSI_MA_Period)
+      {
+         ArrayCopy(outRSI, m_rsi);
+         ArrayCopy(outRSIMa, m_rsiMa);
+         ArraySetAsSeries(outRSI, true);
+         ArraySetAsSeries(outRSIMa, true);
+         return true;
+      }
+      
+      if(m_rsiHandle == INVALID_HANDLE) return false;
+      
+      int copyCount = needed + RSI_MA_Period + 10;
+      ArrayResize(m_rsi, copyCount);
+      ArraySetAsSeries(m_rsi, true);
+      
+      int copied = CopyBuffer(m_rsiHandle, 0, 0, copyCount, m_rsi);
+      if(copied <= 0) return false;
+      
+      // Sostituisce EMPTY_VALUE (DBL_MAX) con 50.0 (valore neutro RSI).
+      // EMPTY_VALUE appare nelle prime barre del backtest quando l'indicatore
+      // non è ancora "caldo". Senza questo fix la somma va in overflow e
+      // corrompe TUTTE le m_rsiMa[] per l'intero backtest — zero segnali.
+      for(int i = 0; i < copied; i++)
+         if(m_rsi[i] >= EMPTY_VALUE - 1.0 || m_rsi[i] < 0.0)
+            m_rsi[i] = 50.0;
+      
+      ArrayResize(m_rsiMa, copied);
+      ArraySetAsSeries(m_rsiMa, true);
+      
+      // Inizializza m_rsiMa a 50 (neutro) per le barre dove la SMA non è ancora calcolabile
+      for(int i = 0; i < copied; i++) m_rsiMa[i] = 50.0;
+      
+      if(copied > RSI_MA_Period)
+      {
+         double sum = 0;
+         for(int i = copied - 1; i >= copied - RSI_MA_Period; i--)
+            sum += m_rsi[i];
+         
+         for(int i = copied - RSI_MA_Period - 1; i >= 0; i--)
+         {
+            sum += m_rsi[i];
+            sum -= m_rsi[i + RSI_MA_Period];
+            m_rsiMa[i] = sum / RSI_MA_Period;
+         }
+      }
+      
+      m_lastRSITime = t0;
+      ArrayCopy(outRSI, m_rsi);
+      ArrayCopy(outRSIMa, m_rsiMa);
+      return true;
+   }
+   
+   bool GetATR(int needed, double &outATR[])
+   {
+      // Nessuna cache per ATR: CopyBuffer ogni tick.
+      // La cache ATR causava valori congelati/inconsistenti nel Strategy Tester
+      // quando ATR_TF < InpSignalTF (es M5 su tester M15).
+      if(m_atrHandle == INVALID_HANDLE) return false;
+      
+      int minNeeded = MathMax(needed, ATR_Period * 3 + 10);
+      ArrayResize(m_atr, 0);
+      int copied = CopyBuffer(m_atrHandle, 0, 0, minNeeded, m_atr);
+      if(copied < 2) return false;
+      
+      ArraySetAsSeries(m_atr, true);
+      ArrayCopy(outATR, m_atr);
+      return true;
+   }
+   
+   double GetLatestATR() 
+   { 
+      if((int)ArraySize(m_atr) < 2) return 0.0;
+      return m_atr[1]; 
+   }
+   
+   bool IsCrossUp(int shift) 
+   { 
+      if(shift + 1 >= (int)ArraySize(m_rsi)) return false;
+      return (m_rsi[shift + 1] < m_rsiMa[shift + 1] && m_rsi[shift] >= m_rsiMa[shift]); 
+   }
+   
+   bool IsCrossDown(int shift) 
+   { 
+      if(shift + 1 >= (int)ArraySize(m_rsi)) return false;
+      return (m_rsi[shift + 1] > m_rsiMa[shift + 1] && m_rsi[shift] <= m_rsiMa[shift]); 
+   }
+   
+   double GetRSI(int shift) { return (shift < (int)ArraySize(m_rsi) ? m_rsi[shift] : 0); }
+   double GetRSISMA(int shift) { return (shift < (int)ArraySize(m_rsiMa) ? m_rsiMa[shift] : 0); }
+};
+
+class CLevelManager
+{
+private:
+   double      m_levels[];
+   int         m_count;
+   string      m_loadedDate;
+   bool        m_hasLevels;
+   
+   void Push(double level)
+   {
+      int n = (int)ArraySize(m_levels);
+      ArrayResize(m_levels, n + 1);
+      m_levels[n] = level;
+      m_count = n + 1;
+      m_hasLevels = true;
+   }
+   
+   void AddLevelToArray(double price, double &arr[]) const
+   {
+      int n = (int)ArraySize(arr);
+      ArrayResize(arr, n + 1);
+      arr[n] = price;
+   }
+   
+public:
+   CLevelManager() : m_count(0), m_hasLevels(false) { ArrayResize(m_levels, 0); }
+   
+   void Clear() { ArrayResize(m_levels, 0); m_count = 0; m_hasLevels = false; }
+   
+   void Sort()
+   {
+      if(m_count < 2) return;
+      for(int i = 0; i < m_count - 1; i++)
+         for(int j = i + 1; j < m_count; j++)
+            if(m_levels[i] > m_levels[j])
+            { double tmp = m_levels[i]; m_levels[i] = m_levels[j]; m_levels[j] = tmp; }
+   }
+   
+   bool GetLevelsForDate(const string ymd, double &outLevels[]) const
+   {
+      ArrayResize(outLevels, 0);
+      
+      if(ymd=="2025-11-03"){
+         AddLevelToArray(4127.76, outLevels); AddLevelToArray(4097.98, outLevels); AddLevelToArray(4069.98, outLevels); AddLevelToArray(4042.58, outLevels); AddLevelToArray(4013.99, outLevels);
+         AddLevelToArray(3985.40, outLevels); AddLevelToArray(3953.24, outLevels); AddLevelToArray(3922.86, outLevels); AddLevelToArray(3893.67, outLevels); AddLevelToArray(3866.57, outLevels);
+         AddLevelToArray(3837.35, outLevels);
+      }
+      else if(ymd=="2025-11-04"){
+         AddLevelToArray(4121.80, outLevels); AddLevelToArray(4093.21, outLevels); AddLevelToArray(4065.22, outLevels); AddLevelToArray(4037.15, outLevels); AddLevelToArray(4011.32, outLevels);
+         AddLevelToArray(3978.19, outLevels); AddLevelToArray(3947.62, outLevels); AddLevelToArray(3921.79, outLevels); AddLevelToArray(3896.95, outLevels); AddLevelToArray(3866.57, outLevels);
+      }
+      else if(ymd=="2025-11-05"){
+         AddLevelToArray(4059.19, outLevels); AddLevelToArray(4032.63, outLevels); AddLevelToArray(4004.12, outLevels); AddLevelToArray(3973.68, outLevels); AddLevelToArray(3944.85, outLevels);
+         AddLevelToArray(3916.74, outLevels); AddLevelToArray(3888.49, outLevels); AddLevelToArray(3861.69, outLevels);
+      }
+      else if(ymd=="2025-11-06"){
+         AddLevelToArray(4103.34, outLevels); AddLevelToArray(4075.94, outLevels); AddLevelToArray(4052.11, outLevels); AddLevelToArray(4026.17, outLevels); AddLevelToArray(3999.38, outLevels);
+         AddLevelToArray(3971.33, outLevels); AddLevelToArray(3946.09, outLevels); AddLevelToArray(3919.88, outLevels); AddLevelToArray(3893.08, outLevels); AddLevelToArray(3863.90, outLevels);
+      }
+      else if(ymd=="2025-11-07"){
+         AddLevelToArray(4071.50, outLevels); AddLevelToArray(4047.20, outLevels); AddLevelToArray(4023.24, outLevels); AddLevelToArray(3994.41, outLevels); AddLevelToArray(3965.90, outLevels);
+         AddLevelToArray(3939.99, outLevels); AddLevelToArray(3916.67, outLevels); AddLevelToArray(3890.11, outLevels);
+      }
+      else if(ymd=="2025-11-10"){
+         AddLevelToArray(4103.24, outLevels); AddLevelToArray(4073.44, outLevels); AddLevelToArray(4045.70, outLevels); AddLevelToArray(4017.80, outLevels); AddLevelToArray(3992.42, outLevels);
+         AddLevelToArray(3968.14, outLevels); AddLevelToArray(3943.22, outLevels); AddLevelToArray(3919.53, outLevels); AddLevelToArray(3893.35, outLevels);
+      }
+      else if(ymd=="2025-11-11"){
+         AddLevelToArray(4238.55, outLevels); AddLevelToArray(4210.56, outLevels); AddLevelToArray(4185.54, outLevels); AddLevelToArray(4158.14, outLevels); AddLevelToArray(4131.74, outLevels);
+         AddLevelToArray(4099.17, outLevels); AddLevelToArray(4067.01, outLevels); AddLevelToArray(4037.22, outLevels); AddLevelToArray(4012.08, outLevels); AddLevelToArray(3982.40, outLevels);
+      }
+      else if(ymd=="2025-11-12"){
+         AddLevelToArray(4210.56, outLevels); AddLevelToArray(4181.37, outLevels); AddLevelToArray(4153.97, outLevels); AddLevelToArray(4129.00, outLevels); AddLevelToArray(4097.81, outLevels);
+         AddLevelToArray(4064.25, outLevels); AddLevelToArray(4034.75, outLevels); AddLevelToArray(4005.80, outLevels);
+      }
+      else if(ymd=="2025-11-13"){
+         AddLevelToArray(4320.18, outLevels); AddLevelToArray(4290.97, outLevels); AddLevelToArray(4259.99, outLevels); AddLevelToArray(4233.19, outLevels); AddLevelToArray(4204.60, outLevels);
+         AddLevelToArray(4175.81, outLevels); AddLevelToArray(4146.28, outLevels); AddLevelToArray(4119.69, outLevels); AddLevelToArray(4093.11, outLevels); AddLevelToArray(4058.67, outLevels);
+      }
+      else if(ymd=="2025-11-14"){
+         AddLevelToArray(4369.00, outLevels); AddLevelToArray(4335.64, outLevels); AddLevelToArray(4302.28, outLevels); AddLevelToArray(4270.12, outLevels); AddLevelToArray(4239.31, outLevels);
+         AddLevelToArray(4205.65, outLevels); AddLevelToArray(4177.38, outLevels); AddLevelToArray(4139.67, outLevels); AddLevelToArray(4104.48, outLevels); AddLevelToArray(4066.88, outLevels);
+         AddLevelToArray(4028.01, outLevels);
+      }
+      else if(ymd=="2025-11-17"){
+         AddLevelToArray(4214.56, outLevels); AddLevelToArray(4181.24, outLevels); AddLevelToArray(4146.72, outLevels); AddLevelToArray(4111.02, outLevels); AddLevelToArray(4076.11, outLevels);
+         AddLevelToArray(4041.59, outLevels); AddLevelToArray(4009.23, outLevels); AddLevelToArray(3974.08, outLevels); AddLevelToArray(3937.75, outLevels);
+      }
+      else if(ymd=="2025-11-18"){
+         AddLevelToArray(4206.73, outLevels); AddLevelToArray(4175.78, outLevels); AddLevelToArray(4140.81, outLevels); AddLevelToArray(4104.67, outLevels); AddLevelToArray(4069.43, outLevels);
+         AddLevelToArray(4036.18, outLevels); AddLevelToArray(4005.49, outLevels); AddLevelToArray(3965.82, outLevels); AddLevelToArray(3932.50, outLevels); AddLevelToArray(3903.20, outLevels);
+      }
+      else if(ymd=="2025-11-19"){
+         AddLevelToArray(4206.73, outLevels); AddLevelToArray(4178.64, outLevels); AddLevelToArray(4143.37, outLevels); AddLevelToArray(4105.38, outLevels); AddLevelToArray(4070.70, outLevels);
+         AddLevelToArray(4040.63, outLevels); AddLevelToArray(4008.31, outLevels); AddLevelToArray(3968.27, outLevels); AddLevelToArray(3937.54, outLevels);
+      }
+      else if(ymd=="2025-11-20"){
+         AddLevelToArray(4211.80, outLevels); AddLevelToArray(4181.57, outLevels); AddLevelToArray(4146.16, outLevels); AddLevelToArray(4109.29, outLevels); AddLevelToArray(4074.15, outLevels);
+         AddLevelToArray(4040.63, outLevels); AddLevelToArray(4011.09, outLevels); AddLevelToArray(3973.86, outLevels);
+      }
+      else if(ymd=="2025-11-21"){
+         AddLevelToArray(4211.14, outLevels); AddLevelToArray(4179.01, outLevels); AddLevelToArray(4145.46, outLevels); AddLevelToArray(4109.29, outLevels); AddLevelToArray(4075.93, outLevels);
+         AddLevelToArray(4043.38, outLevels); AddLevelToArray(4008.63, outLevels); AddLevelToArray(3968.89, outLevels); AddLevelToArray(3932.86, outLevels);
+      }
+      else if(ymd=="2025-11-24"){
+         AddLevelToArray(4211.14, outLevels); AddLevelToArray(4179.01, outLevels); AddLevelToArray(4147.81, outLevels); AddLevelToArray(4112.00, outLevels); AddLevelToArray(4079.50, outLevels);
+         AddLevelToArray(4047.00, outLevels); AddLevelToArray(4010.46, outLevels); AddLevelToArray(3972.83, outLevels); AddLevelToArray(3935.76, outLevels);
+      }
+      else if(ymd=="2025-11-25"){
+         AddLevelToArray(4238.11, outLevels); AddLevelToArray(4207.19, outLevels); AddLevelToArray(4174.22, outLevels); AddLevelToArray(4143.47, outLevels); AddLevelToArray(4108.27, outLevels);
+         AddLevelToArray(4078.21, outLevels); AddLevelToArray(4045.41, outLevels); AddLevelToArray(4010.55, outLevels); AddLevelToArray(3971.70, outLevels); AddLevelToArray(3931.79, outLevels);
+      }
+      else if(ymd=="2025-11-26"){
+         AddLevelToArray(4273.69, outLevels); AddLevelToArray(4242.40, outLevels); AddLevelToArray(4212.35, outLevels); AddLevelToArray(4181.28, outLevels); AddLevelToArray(4146.58, outLevels);
+         AddLevelToArray(4111.42, outLevels); AddLevelToArray(4082.04, outLevels); AddLevelToArray(4044.63, outLevels); AddLevelToArray(4012.76, outLevels); AddLevelToArray(3979.03, outLevels);
+      }
+      else if(ymd=="2025-11-27"){
+         AddLevelToArray(4273.69, outLevels); AddLevelToArray(4240.08, outLevels); AddLevelToArray(4207.35, outLevels); AddLevelToArray(4172.25, outLevels); AddLevelToArray(4143.10, outLevels);
+         AddLevelToArray(4108.29, outLevels); AddLevelToArray(4073.19, outLevels); AddLevelToArray(4041.66, outLevels); AddLevelToArray(4008.04, outLevels);
+      }
+      else if(ymd=="2025-11-28"){
+         AddLevelToArray(4241.28, outLevels); AddLevelToArray(4216.68, outLevels); AddLevelToArray(4193.67, outLevels); AddLevelToArray(4169.50, outLevels); AddLevelToArray(4139.90, outLevels);
+         AddLevelToArray(4110.09, outLevels); AddLevelToArray(4078.58, outLevels); AddLevelToArray(4043.20, outLevels); AddLevelToArray(4010.83, outLevels);
+      }
+      else if(ymd=="2025-12-01"){
+         AddLevelToArray(4324.57, outLevels); AddLevelToArray(4296.17, outLevels); AddLevelToArray(4267.61, outLevels); AddLevelToArray(4237.83, outLevels); AddLevelToArray(4209.18, outLevels);
+         AddLevelToArray(4188.77, outLevels); AddLevelToArray(4164.44, outLevels); AddLevelToArray(4140.77, outLevels); AddLevelToArray(4111.50, outLevels);
+      }
+      else if(ymd=="2025-12-02"){
+         AddLevelToArray(4299.17, outLevels); AddLevelToArray(4278.24, outLevels); AddLevelToArray(4255.96, outLevels); AddLevelToArray(4229.60, outLevels); AddLevelToArray(4209.81, outLevels);
+         AddLevelToArray(4187.32, outLevels); AddLevelToArray(4167.18, outLevels);
+      }
+      else if(ymd=="2025-12-03"){
+         AddLevelToArray(4299.17, outLevels); AddLevelToArray(4275.65, outLevels); AddLevelToArray(4254.85, outLevels); AddLevelToArray(4233.23, outLevels); AddLevelToArray(4213.24, outLevels);
+         AddLevelToArray(4192.70, outLevels); AddLevelToArray(4170.01, outLevels); AddLevelToArray(4144.88, outLevels); AddLevelToArray(4121.11, outLevels);
+      }
+      else if(ymd=="2025-12-04"){
+         AddLevelToArray(4275.79, outLevels); AddLevelToArray(4251.23, outLevels); AddLevelToArray(4227.56, outLevels); AddLevelToArray(4205.73, outLevels); AddLevelToArray(4188.05, outLevels);
+         AddLevelToArray(4167.92, outLevels); AddLevelToArray(4144.41, outLevels); AddLevelToArray(4119.88, outLevels);
+      }
+      else if(ymd=="2025-12-05"){
+         AddLevelToArray(4275.15, outLevels); AddLevelToArray(4254.72, outLevels); AddLevelToArray(4230.06, outLevels); AddLevelToArray(4205.56, outLevels); AddLevelToArray(4183.25, outLevels);
+         AddLevelToArray(4164.02, outLevels); AddLevelToArray(4143.27, outLevels); AddLevelToArray(4120.52, outLevels);
+      }
+      else if(ymd=="2025-12-08"){
+         AddLevelToArray(4271.06, outLevels); AddLevelToArray(4250.60, outLevels); AddLevelToArray(4228.41, outLevels); AddLevelToArray(4209.43, outLevels); AddLevelToArray(4188.47, outLevels);
+         AddLevelToArray(4168.88, outLevels); AddLevelToArray(4144.37, outLevels); AddLevelToArray(4122.65, outLevels);
+      }
+      else if(ymd=="2025-12-09"){
+         AddLevelToArray(4271.87, outLevels); AddLevelToArray(4254.67, outLevels); AddLevelToArray(4234.84, outLevels); AddLevelToArray(4214.14, outLevels); AddLevelToArray(4191.11, outLevels);
+         AddLevelToArray(4169.53, outLevels); AddLevelToArray(4149.41, outLevels); AddLevelToArray(4128.71, outLevels);
+      }
+      else if(ymd=="2025-12-10"){
+         AddLevelToArray(4277.55, outLevels); AddLevelToArray(4256.93, outLevels); AddLevelToArray(4236.26, outLevels); AddLevelToArray(4215.84, outLevels); AddLevelToArray(4194.44, outLevels);
+         AddLevelToArray(4173.28, outLevels); AddLevelToArray(4152.33, outLevels); AddLevelToArray(4133.08, outLevels);
+      }
+      else if(ymd=="2025-12-11"){
+         AddLevelToArray(4269.25, outLevels); AddLevelToArray(4250.88, outLevels); AddLevelToArray(4231.18, outLevels); AddLevelToArray(4212.52, outLevels); AddLevelToArray(4192.13, outLevels);
+         AddLevelToArray(4173.90, outLevels); AddLevelToArray(4154.37, outLevels); AddLevelToArray(4137.75, outLevels);
+      }
+      else if(ymd=="2025-12-12"){
+         AddLevelToArray(4358.31, outLevels); AddLevelToArray(4342.00, outLevels); AddLevelToArray(4324.57, outLevels); AddLevelToArray(4302.86, outLevels); AddLevelToArray(4289.14, outLevels);
+         AddLevelToArray(4275.19, outLevels); AddLevelToArray(4258.86, outLevels); AddLevelToArray(4245.23, outLevels); AddLevelToArray(4231.66, outLevels); AddLevelToArray(4215.76, outLevels);
+         AddLevelToArray(4198.88, outLevels); AddLevelToArray(4182.60, outLevels);
+      }
+      else if(ymd=="2025-12-15"){
+         AddLevelToArray(4382.90, outLevels); AddLevelToArray(4363.16, outLevels); AddLevelToArray(4343.09, outLevels); AddLevelToArray(4324.81, outLevels); AddLevelToArray(4304.36, outLevels);
+         AddLevelToArray(4285.43, outLevels); AddLevelToArray(4264.18, outLevels); AddLevelToArray(4244.20, outLevels); AddLevelToArray(4227.04, outLevels);
+      }
+      else if(ymd=="2025-12-16"){
+         AddLevelToArray(4377.89, outLevels); AddLevelToArray(4357.60, outLevels); AddLevelToArray(4339.52, outLevels); AddLevelToArray(4320.99, outLevels); AddLevelToArray(4301.91, outLevels);
+         AddLevelToArray(4281.92, outLevels); AddLevelToArray(4264.18, outLevels); AddLevelToArray(4243.18, outLevels);
+      }
+      else if(ymd=="2025-12-17"){
+         AddLevelToArray(4369.77, outLevels); AddLevelToArray(4351.68, outLevels); AddLevelToArray(4334.90, outLevels); AddLevelToArray(4315.01, outLevels); AddLevelToArray(4297.24, outLevels);
+         AddLevelToArray(4278.84, outLevels); AddLevelToArray(4258.90, outLevels); AddLevelToArray(4239.93, outLevels); AddLevelToArray(4221.01, outLevels);
+      }
+      else if(ymd=="2025-12-18"){
+         AddLevelToArray(4378.32, outLevels); AddLevelToArray(4361.32, outLevels); AddLevelToArray(4346.48, outLevels); AddLevelToArray(4328.51, outLevels); AddLevelToArray(4310.55, outLevels);
+         AddLevelToArray(4293.00, outLevels); AddLevelToArray(4276.06, outLevels);
+      }
+      else if(ymd=="2025-12-19"){
+         AddLevelToArray(4385.07, outLevels); AddLevelToArray(4371.86, outLevels); AddLevelToArray(4357.02, outLevels); AddLevelToArray(4340.32, outLevels); AddLevelToArray(4323.86, outLevels);
+         AddLevelToArray(4306.94, outLevels); AddLevelToArray(4290.25, outLevels); AddLevelToArray(4274.94, outLevels);
+      }
+      else if(ymd=="2025-12-22"){
+         AddLevelToArray(4442.88, outLevels); AddLevelToArray(4429.57, outLevels); AddLevelToArray(4416.52, outLevels); AddLevelToArray(4400.25, outLevels); AddLevelToArray(4385.93, outLevels);
+         AddLevelToArray(4369.93, outLevels); AddLevelToArray(4353.98, outLevels); AddLevelToArray(4336.01, outLevels); AddLevelToArray(4317.56, outLevels); AddLevelToArray(4300.17, outLevels);
+         AddLevelToArray(4283.27, outLevels); AddLevelToArray(4264.39, outLevels);
+      }
+      else if(ymd=="2025-12-23"){
+         AddLevelToArray(4511.17, outLevels); AddLevelToArray(4498.74, outLevels); AddLevelToArray(4483.13, outLevels); AddLevelToArray(4467.13, outLevels); AddLevelToArray(4453.37, outLevels);
+         AddLevelToArray(4440.60, outLevels); AddLevelToArray(4426.21, outLevels); AddLevelToArray(4412.20, outLevels); AddLevelToArray(4397.75, outLevels); AddLevelToArray(4382.63, outLevels);
+      }
+      else if(ymd=="2025-12-24"){
+         AddLevelToArray(4516.30, outLevels); AddLevelToArray(4504.32, outLevels); AddLevelToArray(4492.35, outLevels); AddLevelToArray(4479.79, outLevels); AddLevelToArray(4467.74, outLevels);
+         AddLevelToArray(4455.68, outLevels);
+      }
+      else if(ymd=="2025-12-26"){
+         AddLevelToArray(4530.77, outLevels); AddLevelToArray(4518.39, outLevels); AddLevelToArray(4504.92, outLevels); AddLevelToArray(4492.12, outLevels); AddLevelToArray(4479.11, outLevels);
+         AddLevelToArray(4466.22, outLevels); AddLevelToArray(4454.16, outLevels); AddLevelToArray(4442.65, outLevels);
+      }
+      else if(ymd=="2025-12-29"){
+         AddLevelToArray(4571.27, outLevels); AddLevelToArray(4557.97, outLevels); AddLevelToArray(4543.30, outLevels); AddLevelToArray(4530.28, outLevels); AddLevelToArray(4515.32, outLevels);
+         AddLevelToArray(4499.26, outLevels); AddLevelToArray(4482.36, outLevels); AddLevelToArray(4467.35, outLevels); AddLevelToArray(4455.34, outLevels); AddLevelToArray(4443.73, outLevels);
+         AddLevelToArray(4432.71, outLevels); AddLevelToArray(4419.37, outLevels); AddLevelToArray(4403.71, outLevels); AddLevelToArray(4388.80, outLevels); AddLevelToArray(4371.89, outLevels);
+         AddLevelToArray(4355.48, outLevels); AddLevelToArray(4334.61, outLevels); AddLevelToArray(4315.34, outLevels); AddLevelToArray(4296.74, outLevels); AddLevelToArray(4277.38, outLevels);
+      }
+      else if(ymd=="2025-12-30"){
+         AddLevelToArray(4401.73, outLevels); AddLevelToArray(4385.33, outLevels); AddLevelToArray(4368.33, outLevels); AddLevelToArray(4350.13, outLevels); AddLevelToArray(4329.56, outLevels);
+         AddLevelToArray(4312.71, outLevels); AddLevelToArray(4296.74, outLevels); AddLevelToArray(4279.30, outLevels); AddLevelToArray(4262.82, outLevels);
+      }
+      else if(ymd=="2025-12-31"){
+         AddLevelToArray(4415.29, outLevels); AddLevelToArray(4398.05, outLevels); AddLevelToArray(4380.53, outLevels); AddLevelToArray(4359.13, outLevels); AddLevelToArray(4342.00, outLevels);
+         AddLevelToArray(4324.37, outLevels); AddLevelToArray(4308.35, outLevels); AddLevelToArray(4292.45, outLevels); AddLevelToArray(4276.23, outLevels);
+      }
+      else if(ymd=="2026-01-02"){
+         AddLevelToArray(4442.58, outLevels); AddLevelToArray(4421.64, outLevels); AddLevelToArray(4401.03, outLevels); AddLevelToArray(4376.66, outLevels); AddLevelToArray(4352.91, outLevels);
+         AddLevelToArray(4330.45, outLevels); AddLevelToArray(4308.24, outLevels); AddLevelToArray(4287.02, outLevels); AddLevelToArray(4265.00, outLevels); AddLevelToArray(4243.41, outLevels);
+      }
+      else if(ymd=="2026-01-05"){
+         AddLevelToArray(4445.00, outLevels); AddLevelToArray(4421.64, outLevels); AddLevelToArray(4398.84, outLevels); AddLevelToArray(4375.02, outLevels); AddLevelToArray(4350.66, outLevels);
+         AddLevelToArray(4326.31, outLevels); AddLevelToArray(4303.29, outLevels); AddLevelToArray(4282.92, outLevels); AddLevelToArray(4258.32, outLevels); AddLevelToArray(4237.22, outLevels);
+      }
+      else if(ymd=="2026-01-06"){
+         AddLevelToArray(4510.37, outLevels); AddLevelToArray(4493.63, outLevels); AddLevelToArray(4477.56, outLevels); AddLevelToArray(4459.82, outLevels); AddLevelToArray(4437.39, outLevels);
+         AddLevelToArray(4417.98, outLevels); AddLevelToArray(4398.56, outLevels); AddLevelToArray(4374.20, outLevels); AddLevelToArray(4352.32, outLevels);
+      }
+      else if(ymd=="2026-01-07"){
+         AddLevelToArray(4561.48, outLevels); AddLevelToArray(4544.57, outLevels); AddLevelToArray(4526.67, outLevels); AddLevelToArray(4510.43, outLevels); AddLevelToArray(4491.87, outLevels);
+         AddLevelToArray(4475.30, outLevels); AddLevelToArray(4455.74, outLevels); AddLevelToArray(4435.52, outLevels); AddLevelToArray(4417.29, outLevels); AddLevelToArray(4398.56, outLevels);
+      }
+      else if(ymd=="2026-01-08"){
+         AddLevelToArray(4544.57, outLevels); AddLevelToArray(4526.67, outLevels); AddLevelToArray(4509.75, outLevels); AddLevelToArray(4494.25, outLevels); AddLevelToArray(4477.38, outLevels);
+         AddLevelToArray(4457.79, outLevels); AddLevelToArray(4438.21, outLevels); AddLevelToArray(4419.71, outLevels); AddLevelToArray(4399.85, outLevels); AddLevelToArray(4378.84, outLevels);
+      }
+      else if(ymd=="2026-01-09"){
+         AddLevelToArray(4546.56, outLevels); AddLevelToArray(4526.67, outLevels); AddLevelToArray(4506.45, outLevels); AddLevelToArray(4487.52, outLevels); AddLevelToArray(4468.29, outLevels);
+         AddLevelToArray(4447.13, outLevels); AddLevelToArray(4426.62, outLevels); AddLevelToArray(4403.67, outLevels); AddLevelToArray(4380.20, outLevels);
+      }
+      else if(ymd=="2026-01-12"){
+         AddLevelToArray(4623.53, outLevels); AddLevelToArray(4603.90, outLevels); AddLevelToArray(4586.94, outLevels); AddLevelToArray(4564.46, outLevels); AddLevelToArray(4544.90, outLevels);
+         AddLevelToArray(4528.66, outLevels); AddLevelToArray(4511.60, outLevels); AddLevelToArray(4491.48, outLevels); AddLevelToArray(4473.70, outLevels); AddLevelToArray(4451.97, outLevels);
+         AddLevelToArray(4433.53, outLevels);
+      }
+      else if(ymd=="2026-01-13"){
+         AddLevelToArray(4672.29, outLevels); AddLevelToArray(4648.48, outLevels); AddLevelToArray(4621.90, outLevels); AddLevelToArray(4600.74, outLevels); AddLevelToArray(4572.90, outLevels);
+         AddLevelToArray(4546.29, outLevels); AddLevelToArray(4518.03, outLevels);
+      }
+      else if(ymd=="2026-01-14"){
+         AddLevelToArray(4670.48, outLevels); AddLevelToArray(4643.65, outLevels); AddLevelToArray(4619.82, outLevels); AddLevelToArray(4597.86, outLevels); AddLevelToArray(4575.27, outLevels);
+         AddLevelToArray(4546.50, outLevels); AddLevelToArray(4519.14, outLevels); AddLevelToArray(4489.69, outLevels); AddLevelToArray(4459.75, outLevels);
+      }
+      else if(ymd=="2026-01-15"){
+         AddLevelToArray(4670.48, outLevels); AddLevelToArray(4643.65, outLevels); AddLevelToArray(4621.54, outLevels); AddLevelToArray(4597.72, outLevels); AddLevelToArray(4574.22, outLevels);
+         AddLevelToArray(4549.18, outLevels); AddLevelToArray(4516.94, outLevels); AddLevelToArray(4488.65, outLevels);
+      }
+      else if(ymd=="2026-01-16"){
+         AddLevelToArray(4685.17, outLevels); AddLevelToArray(4662.91, outLevels); AddLevelToArray(4639.90, outLevels); AddLevelToArray(4618.64, outLevels); AddLevelToArray(4591.17, outLevels);
+         AddLevelToArray(4566.81, outLevels); AddLevelToArray(4541.12, outLevels);
+      }
+      else if(ymd=="2026-01-19"){
+         AddLevelToArray(4685.17, outLevels); AddLevelToArray(4660.05, outLevels); AddLevelToArray(4637.12, outLevels); AddLevelToArray(4615.00, outLevels); AddLevelToArray(4592.49, outLevels);
+         AddLevelToArray(4569.99, outLevels); AddLevelToArray(4546.84, outLevels);
+      }
+      else if(ymd=="2026-01-20"){
+         AddLevelToArray(4793.43, outLevels); AddLevelToArray(4775.61, outLevels); AddLevelToArray(4757.25, outLevels); AddLevelToArray(4736.87, outLevels); AddLevelToArray(4719.43, outLevels);
+         AddLevelToArray(4696.99, outLevels); AddLevelToArray(4677.12, outLevels); AddLevelToArray(4655.27, outLevels); AddLevelToArray(4633.67, outLevels); AddLevelToArray(4612.46, outLevels);
+         AddLevelToArray(4590.23, outLevels);
+      }
+      else if(ymd=="2026-01-21"){
+         AddLevelToArray(4913.91, outLevels); AddLevelToArray(4894.21, outLevels); AddLevelToArray(4874.07, outLevels); AddLevelToArray(4856.21, outLevels); AddLevelToArray(4833.04, outLevels);
+         AddLevelToArray(4812.42, outLevels); AddLevelToArray(4792.89, outLevels); AddLevelToArray(4772.38, outLevels); AddLevelToArray(4753.10, outLevels); AddLevelToArray(4733.72, outLevels);
+         AddLevelToArray(4715.24, outLevels); AddLevelToArray(4693.31, outLevels);
+      }
+      else if(ymd=="2026-01-22"){
+         AddLevelToArray(4966.95, outLevels); AddLevelToArray(4943.33, outLevels); AddLevelToArray(4921.03, outLevels); AddLevelToArray(4899.02, outLevels); AddLevelToArray(4877.37, outLevels);
+         AddLevelToArray(4853.55, outLevels); AddLevelToArray(4828.22, outLevels); AddLevelToArray(4803.79, outLevels); AddLevelToArray(4776.28, outLevels); AddLevelToArray(4750.47, outLevels);
+         AddLevelToArray(4721.69, outLevels);
+      }
+      else if(ymd=="2026-01-23"){
+         AddLevelToArray(4989.64, outLevels); AddLevelToArray(4966.95, outLevels); AddLevelToArray(4943.33, outLevels); AddLevelToArray(4918.05, outLevels); AddLevelToArray(4895.71, outLevels);
+         AddLevelToArray(4870.76, outLevels); AddLevelToArray(4847.66, outLevels); AddLevelToArray(4821.60, outLevels);
+      }
+      else if(ymd=="2026-01-26"){
+         AddLevelToArray(5115.08, outLevels); AddLevelToArray(5097.86, outLevels); AddLevelToArray(5078.56, outLevels); AddLevelToArray(5057.59, outLevels); AddLevelToArray(5031.93, outLevels);
+         AddLevelToArray(5007.82, outLevels); AddLevelToArray(4984.24, outLevels); AddLevelToArray(4961.50, outLevels); AddLevelToArray(4936.91, outLevels); AddLevelToArray(4911.27, outLevels);
+         AddLevelToArray(4879.66, outLevels); AddLevelToArray(4851.31, outLevels);
+      }
+      else if(ymd=="2026-01-27"){
+         AddLevelToArray(5153.51, outLevels); AddLevelToArray(5125.23, outLevels); AddLevelToArray(5096.19, outLevels); AddLevelToArray(5064.63, outLevels); AddLevelToArray(5033.46, outLevels);
+         AddLevelToArray(4998.75, outLevels); AddLevelToArray(4958.82, outLevels); AddLevelToArray(4919.77, outLevels); AddLevelToArray(4881.70, outLevels); AddLevelToArray(4847.89, outLevels);
+      }
+      else if(ymd=="2026-01-28"){
+         AddLevelToArray(5359.49, outLevels); AddLevelToArray(5328.23, outLevels); AddLevelToArray(5301.47, outLevels); AddLevelToArray(5271.51, outLevels); AddLevelToArray(5243.94, outLevels);
+         AddLevelToArray(5212.86, outLevels); AddLevelToArray(5180.87, outLevels); AddLevelToArray(5152.26, outLevels); AddLevelToArray(5123.58, outLevels); AddLevelToArray(5094.59, outLevels);
+         AddLevelToArray(5061.98, outLevels);
+      }
+      else if(ymd=="2026-01-29"){
+         AddLevelToArray(5643.83, outLevels); AddLevelToArray(5600.00, outLevels); AddLevelToArray(5552.39, outLevels); AddLevelToArray(5498.92, outLevels); AddLevelToArray(5445.75, outLevels);
+         AddLevelToArray(5397.47, outLevels); AddLevelToArray(5354.75, outLevels); AddLevelToArray(5309.52, outLevels); AddLevelToArray(5250.84, outLevels); AddLevelToArray(5202.30, outLevels);
+      }
+      else if(ymd=="2026-01-30"){
+         AddLevelToArray(5658.75, outLevels); AddLevelToArray(5604.00, outLevels); AddLevelToArray(5556.89, outLevels); AddLevelToArray(5502.93, outLevels); AddLevelToArray(5453.11, outLevels);
+         AddLevelToArray(5400.77, outLevels); AddLevelToArray(5349.51, outLevels); AddLevelToArray(5301.02, outLevels); AddLevelToArray(5244.10, outLevels); AddLevelToArray(5189.95, outLevels);
+      }
+      else if(ymd=="2026-02-02"){
+         AddLevelToArray(5047.67, outLevels); AddLevelToArray(5002.96, outLevels); AddLevelToArray(4964.64, outLevels); AddLevelToArray(4926.32, outLevels); AddLevelToArray(4879.19, outLevels);
+         AddLevelToArray(4831.95, outLevels); AddLevelToArray(4780.49, outLevels); AddLevelToArray(4729.96, outLevels); AddLevelToArray(4682.35, outLevels); AddLevelToArray(4634.47, outLevels);
+         AddLevelToArray(4532.05, outLevels); AddLevelToArray(4482.84, outLevels); AddLevelToArray(4409.00, outLevels); AddLevelToArray(4433.74, outLevels); AddLevelToArray(4392.32, outLevels);
+         AddLevelToArray(4350.91, outLevels);
+      }
+      else if(ymd=="2026-02-03"){
+         AddLevelToArray(4988.65, outLevels); AddLevelToArray(4952.65, outLevels); AddLevelToArray(4914.21, outLevels); AddLevelToArray(4884.57, outLevels); AddLevelToArray(4848.53, outLevels);
+         AddLevelToArray(4805.99, outLevels); AddLevelToArray(4790.10, outLevels); AddLevelToArray(4768.25, outLevels); AddLevelToArray(4715.42, outLevels); AddLevelToArray(4620.73, outLevels);
+         AddLevelToArray(4563.78, outLevels); AddLevelToArray(4511.63, outLevels); AddLevelToArray(4468.40, outLevels); AddLevelToArray(4416.63, outLevels);
+      }
+      else if(ymd=="2026-02-04"){
+         AddLevelToArray(5149.28, outLevels); AddLevelToArray(5097.48, outLevels); AddLevelToArray(5044.24, outLevels); AddLevelToArray(4996.14, outLevels); AddLevelToArray(4948.43, outLevels);
+         AddLevelToArray(4900.20, outLevels); AddLevelToArray(4851.46, outLevels); AddLevelToArray(4800.66, outLevels); AddLevelToArray(4703.00, outLevels); AddLevelToArray(4758.08, outLevels);
+      }
+      else if(ymd=="2026-02-05"){
+         AddLevelToArray(5138.10, outLevels); AddLevelToArray(5089.38, outLevels); AddLevelToArray(5039.79, outLevels); AddLevelToArray(4990.45, outLevels); AddLevelToArray(4944.86, outLevels);
+         AddLevelToArray(4896.20, outLevels); AddLevelToArray(4843.94, outLevels); AddLevelToArray(4793.80, outLevels); AddLevelToArray(4742.94, outLevels); AddLevelToArray(4689.73, outLevels);
+         AddLevelToArray(4638.87, outLevels);
+      }
+      else if(ymd=="2026-02-06"){
+         AddLevelToArray(4984.76, outLevels); AddLevelToArray(4940.41, outLevels); AddLevelToArray(4897.44, outLevels); AddLevelToArray(4854.08, outLevels); AddLevelToArray(4803.00, outLevels);
+         AddLevelToArray(4774.77, outLevels); AddLevelToArray(4746.79, outLevels); AddLevelToArray(4693.43, outLevels); AddLevelToArray(4638.87, outLevels); AddLevelToArray(4590.35, outLevels);
+         AddLevelToArray(4540.27, outLevels);
+      }
+      else if(ymd=="2026-02-09"){
+         AddLevelToArray(5109.05, outLevels); AddLevelToArray(5056.75, outLevels); AddLevelToArray(5009.62, outLevels); AddLevelToArray(4956.67, outLevels); AddLevelToArray(4905.52, outLevels);
+         AddLevelToArray(4853.78, outLevels); AddLevelToArray(4803.35, outLevels); AddLevelToArray(4738.74, outLevels); AddLevelToArray(4680.18, outLevels);
+      }
+      else if(ymd=="2026-02-10"){
+         AddLevelToArray(5294.60, outLevels); AddLevelToArray(5191.00, outLevels); AddLevelToArray(5139.66, outLevels); AddLevelToArray(5081.07, outLevels); AddLevelToArray(5034.62, outLevels);
+         AddLevelToArray(4984.02, outLevels); AddLevelToArray(4934.24, outLevels); AddLevelToArray(4875.35, outLevels); AddLevelToArray(4811.47, outLevels);
+      }
+      else if(ymd=="2026-02-11"){
+         AddLevelToArray(5236.71, outLevels); AddLevelToArray(5181.93, outLevels); AddLevelToArray(5123.51, outLevels); AddLevelToArray(5075.63, outLevels); AddLevelToArray(5046.00, outLevels);
+         AddLevelToArray(5016.51, outLevels); AddLevelToArray(4967.33, outLevels); AddLevelToArray(4912.29, outLevels); AddLevelToArray(4855.00, outLevels); AddLevelToArray(4805.51, outLevels);
+      }
+      else if(ymd=="2026-02-12"){
+         AddLevelToArray(5265.82, outLevels); AddLevelToArray(5243.25, outLevels); AddLevelToArray(5208.54, outLevels); AddLevelToArray(5159.24, outLevels); AddLevelToArray(5117.76, outLevels);
+         AddLevelToArray(5075.63, outLevels); AddLevelToArray(5037.65, outLevels); AddLevelToArray(4999.12, outLevels); AddLevelToArray(4958.92, outLevels); AddLevelToArray(4909.12, outLevels);
+         AddLevelToArray(4864.40, outLevels); AddLevelToArray(4812.17, outLevels);
+      }
+      else if(ymd=="2026-02-13"){
+         AddLevelToArray(5076.73, outLevels); AddLevelToArray(5044.91, outLevels); AddLevelToArray(5004.15, outLevels); AddLevelToArray(4960.96, outLevels); AddLevelToArray(4914.19, outLevels);
+         AddLevelToArray(4870.79, outLevels); AddLevelToArray(4825.68, outLevels); AddLevelToArray(4778.31, outLevels);
+      }
+      else if(ymd=="2026-02-16"){
+         AddLevelToArray(5155.03, outLevels); AddLevelToArray(5114.15, outLevels); AddLevelToArray(5075.62, outLevels); AddLevelToArray(5039.88, outLevels); AddLevelToArray(5001.35, outLevels);
+         AddLevelToArray(4961.15, outLevels); AddLevelToArray(4914.19, outLevels); AddLevelToArray(4866.75, outLevels);
+      }
+      else if(ymd=="2026-02-17"){
+         AddLevelToArray(5149.85, outLevels); AddLevelToArray(5111.59, outLevels); AddLevelToArray(5074.27, outLevels); AddLevelToArray(5037.25, outLevels); AddLevelToArray(4997.56, outLevels);
+         AddLevelToArray(4963.07, outLevels); AddLevelToArray(4920.57, outLevels); AddLevelToArray(4878.73, outLevels); AddLevelToArray(4837.35, outLevels); AddLevelToArray(4787.39, outLevels);
+      }
+      else if(ymd=="2026-02-18"){
+         AddLevelToArray(5007.40, outLevels); AddLevelToArray(4977.69, outLevels); AddLevelToArray(4947.32, outLevels); AddLevelToArray(4912.68, outLevels); AddLevelToArray(4878.73, outLevels);
+         AddLevelToArray(4842.48, outLevels); AddLevelToArray(4805.69, outLevels); AddLevelToArray(4768.90, outLevels); AddLevelToArray(4729.24, outLevels);
+      }
+      else if(ymd=="2026-02-19"){
+         AddLevelToArray(5102.34, outLevels); AddLevelToArray(5079.43, outLevels); AddLevelToArray(5030.72, outLevels); AddLevelToArray(5000.02, outLevels); AddLevelToArray(4972.89, outLevels);
+         AddLevelToArray(4944.55, outLevels); AddLevelToArray(4910.85, outLevels); AddLevelToArray(4874.51, outLevels); AddLevelToArray(4847.09, outLevels); AddLevelToArray(4811.56, outLevels);
+      }
+      else if(ymd=="2026-02-20"){
+         AddLevelToArray(5102.34, outLevels); AddLevelToArray(5071.15, outLevels); AddLevelToArray(5043.23, outLevels); AddLevelToArray(5017.88, outLevels); AddLevelToArray(4995.03, outLevels);
+         AddLevelToArray(4965.99, outLevels); AddLevelToArray(4935.99, outLevels); AddLevelToArray(4906.40, outLevels); AddLevelToArray(4874.51, outLevels); AddLevelToArray(4847.09, outLevels);
+      }
+      else if(ymd=="2026-02-23"){
+         AddLevelToArray(5228.41, outLevels); AddLevelToArray(5202.51, outLevels); AddLevelToArray(5176.62, outLevels); AddLevelToArray(5150.72, outLevels); AddLevelToArray(5126.12, outLevels);
+         AddLevelToArray(5102.34, outLevels); AddLevelToArray(5079.49, outLevels); AddLevelToArray(5053.03, outLevels); AddLevelToArray(5029.86, outLevels); AddLevelToArray(5006.11, outLevels);
+         AddLevelToArray(4979.70, outLevels);
+      }
+      else if(ymd=="2026-02-24"){
+         AddLevelToArray(5361.79, outLevels); AddLevelToArray(5327.69, outLevels); AddLevelToArray(5294.60, outLevels); AddLevelToArray(5263.54, outLevels); AddLevelToArray(5234.73, outLevels);
+         AddLevelToArray(5205.30, outLevels); AddLevelToArray(5176.62, outLevels); AddLevelToArray(5147.05, outLevels); AddLevelToArray(5123.03, outLevels); AddLevelToArray(5090.82, outLevels);
+         AddLevelToArray(5058.76, outLevels);
+      }
+      else if(ymd=="2026-02-25"){
+         AddLevelToArray(5361.79, outLevels); AddLevelToArray(5327.69, outLevels); AddLevelToArray(5291.72, outLevels); AddLevelToArray(5252.87, outLevels); AddLevelToArray(5210.99, outLevels);
+         AddLevelToArray(5174.66, outLevels); AddLevelToArray(5141.24, outLevels); AddLevelToArray(5108.63, outLevels); AddLevelToArray(5076.90, outLevels); AddLevelToArray(5040.31, outLevels);
+         AddLevelToArray(5002.25, outLevels);
+      }
+      else if(ymd=="2026-02-26"){
+         AddLevelToArray(5283.09, outLevels); AddLevelToArray(5248.24, outLevels); AddLevelToArray(5206.55, outLevels); AddLevelToArray(5167.75, outLevels); AddLevelToArray(5128.94, outLevels);
+         AddLevelToArray(5092.49, outLevels); AddLevelToArray(5050.40, outLevels); AddLevelToArray(5042.41, outLevels); AddLevelToArray(5002.56, outLevels);
+      }
+      else if(ymd=="2026-02-27"){
+         AddLevelToArray(5314.74, outLevels); AddLevelToArray(5275.89, outLevels); AddLevelToArray(5239.14, outLevels); AddLevelToArray(5200.74, outLevels); AddLevelToArray(5159.15, outLevels);
+         AddLevelToArray(5120.49, outLevels); AddLevelToArray(5082.63, outLevels); AddLevelToArray(5035.58, outLevels); AddLevelToArray(4988.52, outLevels);
+      }
+      else if(ymd=="2026-03-02"){
+         AddLevelToArray(5510.63, outLevels); AddLevelToArray(5462.94, outLevels); AddLevelToArray(5418.34, outLevels); AddLevelToArray(5367.98, outLevels); AddLevelToArray(5326.06, outLevels);
+         AddLevelToArray(5290.73, outLevels); AddLevelToArray(5256.98, outLevels); AddLevelToArray(5223.68, outLevels); AddLevelToArray(5191.24, outLevels); AddLevelToArray(5154.88, outLevels);
+         AddLevelToArray(5120.89, outLevels);
+      }
+      else if(ymd=="2026-03-03"){
+         AddLevelToArray(5442.84, outLevels); AddLevelToArray(5408.18, outLevels); AddLevelToArray(5365.22, outLevels); AddLevelToArray(5324.04, outLevels); AddLevelToArray(5286.64, outLevels);
+         AddLevelToArray(5249.62, outLevels); AddLevelToArray(5213.93, outLevels); AddLevelToArray(5176.19, outLevels);
+         AddLevelToArray(5143.60, outLevels); AddLevelToArray(5113.22, outLevels); AddLevelToArray(5082.15, outLevels); AddLevelToArray(5048.55, outLevels); AddLevelToArray(5014.58, outLevels);
+         AddLevelToArray(4980.22, outLevels); AddLevelToArray(4945.11, outLevels); AddLevelToArray(4908.11, outLevels);
+      }
+      else if(ymd=="2026-03-04"){
+         AddLevelToArray(5288.54, outLevels); AddLevelToArray(5259.18, outLevels); AddLevelToArray(5235.92, outLevels);
+         AddLevelToArray(5205.18, outLevels); AddLevelToArray(5170.57, outLevels); AddLevelToArray(5139.55, outLevels); AddLevelToArray(5112.47, outLevels); AddLevelToArray(5078.76, outLevels);
+         AddLevelToArray(4980.22, outLevels); AddLevelToArray(4945.11, outLevels); AddLevelToArray(4908.11, outLevels);
+      }
+      else if(ymd=="2026-03-05"){
+         AddLevelToArray(5263.89, outLevels); AddLevelToArray(5237.83, outLevels); AddLevelToArray(5204.13, outLevels); AddLevelToArray(5173.51, outLevels); AddLevelToArray(5139.59, outLevels);
+         AddLevelToArray(5103.66, outLevels); AddLevelToArray(5066.73, outLevels); AddLevelToArray(5033.87, outLevels); AddLevelToArray(5005.51, outLevels);
+      }
+      else if(ymd=="2026-03-06"){
+         AddLevelToArray(5205.07, outLevels); AddLevelToArray(5174.93, outLevels); AddLevelToArray(5139.25, outLevels); AddLevelToArray(5105.90, outLevels);
+         AddLevelToArray(5070.97, outLevels); AddLevelToArray(5039.06, outLevels); AddLevelToArray(5004.80, outLevels); AddLevelToArray(4975.77, outLevels);
+      }
+      else if(ymd=="2026-03-09"){
+         AddLevelToArray(5282.82, outLevels); AddLevelToArray(5254.31, outLevels); AddLevelToArray(5226.30, outLevels); AddLevelToArray(5198.30, outLevels); AddLevelToArray(5168.78, outLevels);
+         AddLevelToArray(5140.78, outLevels); AddLevelToArray(5108.70, outLevels); AddLevelToArray(5080.19, outLevels); AddLevelToArray(5047.61, outLevels); AddLevelToArray(5013.50, outLevels);
+      }
+      else if(ymd=="2026-03-10"){
+         AddLevelToArray(5260.92, outLevels); AddLevelToArray(5231.40, outLevels); AddLevelToArray(5202.38, outLevels); AddLevelToArray(5174.89, outLevels); AddLevelToArray(5145.87, outLevels);
+         AddLevelToArray(5116.85, outLevels); AddLevelToArray(5088.85, outLevels); AddLevelToArray(5060.10, outLevels); AddLevelToArray(5057.79, outLevels); AddLevelToArray(5027.25, outLevels);
+      }
+      else if(ymd=="2026-03-11"){
+         AddLevelToArray(5334.27, outLevels); AddLevelToArray(5305.71, outLevels); AddLevelToArray(5276.47, outLevels); AddLevelToArray(5249.95, outLevels); AddLevelToArray(5222.07, outLevels);
+         AddLevelToArray(5189.44, outLevels); AddLevelToArray(5163.60, outLevels); AddLevelToArray(5136.40, outLevels); AddLevelToArray(5109.20, outLevels); AddLevelToArray(5083.36, outLevels);
+      }
+      else if(ymd=="2026-03-12"){
+         AddLevelToArray(5319.91, outLevels); AddLevelToArray(5293.41, outLevels); AddLevelToArray(5264.16, outLevels); AddLevelToArray(5238.21, outLevels); AddLevelToArray(5214.48, outLevels);
+         AddLevelToArray(5185.72, outLevels); AddLevelToArray(5157.46, outLevels); AddLevelToArray(5126.27, outLevels); AddLevelToArray(5104.74, outLevels); AddLevelToArray(5076.19, outLevels);
+      }
+      else if(ymd=="2026-03-13"){
+         AddLevelToArray(5182.75, outLevels); AddLevelToArray(5155.89, outLevels); AddLevelToArray(5132.73, outLevels); AddLevelToArray(5106.89, outLevels); AddLevelToArray(5079.86, outLevels);
+         AddLevelToArray(5053.98, outLevels); AddLevelToArray(5023.50, outLevels); AddLevelToArray(4989.28, outLevels); AddLevelToArray(4965.77, outLevels);
+      }
+      else
+      {
+         return false;
+      }
+      
+      int total = (int)ArraySize(outLevels);
+      if(total > 1)
+      {
+         for(int i = 0; i < total - 1; i++)
+            for(int j = i + 1; j < total; j++)
+               if(outLevels[i] > outLevels[j])
+               { double tmp = outLevels[i]; outLevels[i] = outLevels[j]; outLevels[j] = tmp; }
+      }
+      
+      return true;
+   }
+   
+   bool LoadForDate(const string ymd)
+   {
+      Clear();
+      bool ok = GetLevelsForDate(ymd, m_levels);
+      if(ok)
+      {
+         m_count = (int)ArraySize(m_levels);
+         m_hasLevels = true;
+         m_loadedDate = ymd;
+      }
+      return ok;
+   }
+   
+   void Draw();
+   void DeleteObjects();
+   
+   int    Count() const { return m_count; }
+   double Get(int idx) const { return (idx >= 0 && idx < m_count ? m_levels[idx] : 0.0); }
+   string LoadedDate() const { return m_loadedDate; }
+   bool   HasLevels() const { return m_hasLevels; }
+   
+   double NearDistance(int idx) const;
+   bool   IsNear(double price, int idx) const;
+   bool   CandleTouches(int shift, int idx, double touchBuf) const;
+   int    FindNearestToPrice(double price) const;
+   int    FindTouchedClosestToClose(int shift, double touchBuf) const;
+   int    FindNearestNearToClose(int shift, double touchBuf) const;
+   bool   BuildTargets(ENUM_DIR dir, int anchorIdx, int &t1, int &t2, int &t3) const;
+};
+
+class CTradeManager
+{
+private:
+   CTrade      m_trade;
+
+public:
+   TradeState  m_states[];  // public per accesso da OnTradeTransaction
+   CTradeManager() {}
+   
+   bool Init()
+   {
+      m_trade.SetExpertMagicNumber(InpMagicNumber);
+      m_trade.SetDeviationInPoints(SlippagePoints);
+      m_trade.SetTypeFillingBySymbol(_Symbol);
+      return true;
+   }
+   
+   void CleanupStates();
+   int  FindStateIndex(ulong ticket) const;
+   bool IsPartialDone(ulong ticket) const;
+   void SetPartialDone(ulong ticket, bool done);
+   bool IsTarget1Hit(ulong ticket) const;
+   void SetTarget1Hit(ulong ticket, bool hit);
+   bool IsTarget2Hit(ulong ticket) const;
+   void SetTarget2Hit(ulong ticket, bool hit);
+   bool IsBreakevenDone(ulong ticket) const;
+   void SetBreakevenDone(ulong ticket, bool done);
+   
+   bool Open(const SignalResult &sig, const CLevelManager &levels, double atr, const string &openDate);
+   bool ModifySLTP(ulong ticket, double sl, double tp);
+   bool ClosePartial(ulong ticket, double volume);
+   bool CloseFull(ulong ticket);
+   void DeleteTradeObjects(ulong ticket);
+   
+   void ManagePositions(const CLevelManager &levels, CDataCache &cache, PerformanceStats &stats);
+   
+private:
+   double CalculateLotSize(double slDistance, double atr);
+   double NormalizeLots(double lots);
+   string BuildComment(ENUM_SIGNAL_SETUP setup, ENUM_DIR dir, int anchorIdx, int t1, int t2, int t3,
+                       const string &openDate);
+   bool ParseComment(const string &comment, ENUM_SIGNAL_SETUP &setup, ENUM_DIR &dir,
+                     int &anchorIdx, int &t1, int &t2, int &t3, string &openDate);
+   void DrawTradeLevels(ulong ticket, ENUM_SIGNAL_SETUP setup, ENUM_DIR dir,
+                        int anchorIdx, int t1, int t2, int t3);
+   void DeleteTradeLevels(ulong ticket);
+};
+
+// ============================== GLOBALS ==============================
+CDataCache      g_cache;
+CLevelManager   g_levels;
+CTradeManager   g_tradeMgr;
+PerformanceStats g_stats;
+
+int             g_digits = 0;
+double          g_point = 0.0;
+int             g_stopsLevelPoints = 0;
+int             g_freezeLevelPoints = 0;
+datetime        g_lastBarTime = 0;
+datetime        g_lastTradeBarTime = 0;
+bool            g_isHedging = false;
+bool            g_tradingEnabled = false;
+
+datetime        g_lastNoLevelsLog = 0;
+int             g_noLevelsCount = 0;
+double          g_equityTPBaseline = 0.0;  // equity al momento del reset, usata come base per il TP%
+
+// ============================== RSI VISUAL WINDOW ==============================
+int    g_rsiVisualHandle = INVALID_HANDLE;  // handle RSI aggiunto al chart
+int    g_rsiSubWindow    = -1;              // indice sottofinestra RSI
+string g_rsiObjPrefix    = "ELS_RSIW_";    // prefisso oggetti RSI window
+datetime g_rsiLastDraw   = 0;              // ultima barra su cui sono stati disegnati gli oggetti
+
+// ============================== LOGGING ==============================
+void LogEx(ENUM_LOG_LEVEL level, const string msg, const string context = "")
+{
+   if(!EnableLogs) return;
+   if(level > InpLogLevel) return;
+   
+   string prefix;
+   switch(level)
+   {
+      case LOG_ERROR: prefix = "[ERR]"; break;
+      case LOG_WARN:  prefix = "[WRN]"; break;
+      case LOG_INFO:  prefix = "[INF]"; break;
+      case LOG_DEBUG: prefix = "[DBG]"; break;
+   }
+   
+   string fullMsg = StringFormat("%s %s | %s | %s", 
+                    prefix, TimeToString(TimeCurrent(), TIME_SECONDS), context, msg);
+   
+   Print(fullMsg);
+   
+   if(level == LOG_ERROR && InpVisualAlerts)
+      Alert("Enaria ERROR: " + msg);
+}
+
+// ============================== LEVEL MANAGER IMPLEMENTATION =========
+void CLevelManager::Draw()
+{
+   if(!DrawLevelsOnChart || !m_hasLevels) return;
+   DeleteObjects();
+   
+   for(int i = 0; i < m_count; i++)
+   {
+      string hname = "ELS_LVL_" + m_loadedDate + "_" + IntegerToString(i);
+      if(!ObjectCreate(0, hname, OBJ_HLINE, 0, 0, m_levels[i])) continue;
+      
+      ObjectSetInteger(0, hname, OBJPROP_COLOR, LevelColor);
+      ObjectSetInteger(0, hname, OBJPROP_STYLE, LevelStyle);
+      ObjectSetInteger(0, hname, OBJPROP_WIDTH, LevelWidth);
+      ObjectSetInteger(0, hname, OBJPROP_BACK, false);
+      ObjectSetInteger(0, hname, OBJPROP_SELECTABLE, false);
+   }
+   ChartRedraw(0);
+}
+
+void CLevelManager::DeleteObjects()
+{
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string nm = ObjectName(0, i);
+      // Cancella solo le linee dei livelli giornalieri, NON le linee delle trade chiuse
+      if(StringFind(nm, "ELS_LVL_") == 0)
+         ObjectDelete(0, nm);
+   }
+}
+
+double CLevelManager::NearDistance(int idx) const
+{
+   if(idx < 0 || idx >= m_count) return 0.0;
+   
+   double distPrev = (idx > 0) ? MathAbs(m_levels[idx] - m_levels[idx - 1]) : DBL_MAX;
+   double distNext = (idx < m_count - 1) ? MathAbs(m_levels[idx + 1] - m_levels[idx]) : DBL_MAX;
+   
+   double baseDist = MathMin(distPrev, distNext);
+   if(baseDist == DBL_MAX) baseDist = MathMax(distPrev, distNext);
+   if(baseDist == DBL_MAX || baseDist <= 0.0) 
+      baseDist = LevelBufferPoints * g_point * 2;
+   
+   return baseDist * (LevelNearPct / 100.0);
+}
+
+bool CLevelManager::IsNear(double price, int idx) const
+{
+   if(idx < 0 || idx >= m_count) return false;
+   return (MathAbs(price - m_levels[idx]) <= NearDistance(idx));
+}
+
+bool CLevelManager::CandleTouches(int shift, int idx, double touchBuf) const
+{
+   double h = iHigh(_Symbol, InpSignalTF, shift);
+   double l = iLow(_Symbol, InpSignalTF, shift);
+   if(h == 0 || l == 0) return false;
+   
+   double L = m_levels[idx];
+   return (l <= L + touchBuf && h >= L - touchBuf);
+}
+
+int CLevelManager::FindNearestToPrice(double price) const
+{
+   double best = DBL_MAX;
+   int bestIdx = -1;
+   
+   for(int i = 0; i < m_count; i++)
+   {
+      double d = MathAbs(price - m_levels[i]);
+      if(d < best) { best = d; bestIdx = i; }
+   }
+   return bestIdx;
+}
+
+int CLevelManager::FindTouchedClosestToClose(int shift, double touchBuf) const
+{
+   double c = iClose(_Symbol, InpSignalTF, shift);
+   if(c == 0) return -1;
+   
+   double best = DBL_MAX;
+   int bestIdx = -1;
+   
+   for(int i = 0; i < m_count; i++)
+   {
+      if(!CandleTouches(shift, i, touchBuf)) continue;
+      double d = MathAbs(c - m_levels[i]);
+      if(d < best) { best = d; bestIdx = i; }
+   }
+   return bestIdx;
+}
+
+int CLevelManager::FindNearestNearToClose(int shift, double touchBuf) const
+{
+   double c = iClose(_Symbol, InpSignalTF, shift);
+   if(c == 0) return -1;
+   
+   double best = DBL_MAX;
+   int bestIdx = -1;
+   
+   for(int i = 0; i < m_count; i++)
+   {
+      if(!IsNear(c, i) && !CandleTouches(shift, i, touchBuf)) continue;
+      double d = MathAbs(c - m_levels[i]);
+      if(d < best) { best = d; bestIdx = i; }
+   }
+   return bestIdx;
+}
+
+bool CLevelManager::BuildTargets(ENUM_DIR dir, int anchorIdx, int &t1, int &t2, int &t3) const
+{
+   t1 = t2 = t3 = -1;
+   if(anchorIdx < 0 || anchorIdx >= m_count) return false;
+   
+   if(dir == DIR_BUY)
+   {
+      if(anchorIdx + 1 >= m_count) return false;
+      t1 = anchorIdx + 1;
+      // Se T2/T3 non esistono (livelli finiti), rimangono su T1.
+      // Il trailing ATR gestisce l'uscita oltre l'ultimo livello.
+      t2 = (anchorIdx + 2 < m_count) ? anchorIdx + 2 : t1;
+      t3 = (anchorIdx + 3 < m_count) ? anchorIdx + 3 : t2;
+      return true;
+   }
+   else if(dir == DIR_SELL)
+   {
+      if(anchorIdx - 1 < 0) return false;
+      t1 = anchorIdx - 1;
+      // Se T2/T3 non esistono (livelli finiti), rimangono su T1.
+      // Il trailing ATR gestisce l'uscita oltre l'ultimo livello.
+      t2 = (anchorIdx - 2 >= 0) ? anchorIdx - 2 : t1;
+      t3 = (anchorIdx - 3 >= 0) ? anchorIdx - 3 : t2;
+      return true;
+   }
+   return false;
+}
+
+// ============================== TRADE MANAGER IMPLEMENTATION =========
+void CTradeManager::CleanupStates()
+{
+   for(int i = (int)ArraySize(m_states) - 1; i >= 0; i--)
+   {
+      if(!PositionSelectByTicket(m_states[i].ticket))
+      {
+         // HEDGE: se la posizione è chiusa e c'è ancora un hedge pending, cancellalo
+         if(UseHedgeProtection && m_states[i].hedgeTicket != 0)
+            CancelHedgeOrder(m_states[i].hedgeTicket);
+         
+         for(int j = i; j < (int)ArraySize(m_states) - 1; j++)
+            m_states[j] = m_states[j + 1];
+         ArrayResize(m_states, (int)ArraySize(m_states) - 1);
+      }
+   }
+}
+
+int CTradeManager::FindStateIndex(ulong ticket) const
+{
+   for(int i = 0; i < (int)ArraySize(m_states); i++)
+      if(m_states[i].ticket == ticket) return i;
+   return -1;
+}
+
+bool CTradeManager::IsPartialDone(ulong ticket) const
+{
+   int idx = FindStateIndex(ticket);
+   return (idx >= 0 && m_states[idx].partialDone);
+}
+
+void CTradeManager::SetPartialDone(ulong ticket, bool done)
+{
+   int idx = FindStateIndex(ticket);
+   if(idx < 0)
+   {
+      int n = (int)ArraySize(m_states);
+      ArrayResize(m_states, n + 1);
+      m_states[n] = TradeState(ticket);
+      m_states[n].partialDone = done;
+   }
+   else
+      m_states[idx].partialDone = done;
+}
+
+bool CTradeManager::IsTarget1Hit(ulong ticket) const
+{
+   int idx = FindStateIndex(ticket);
+   return (idx >= 0 && m_states[idx].target1Hit);
+}
+
+void CTradeManager::SetTarget1Hit(ulong ticket, bool hit)
+{
+   int idx = FindStateIndex(ticket);
+   if(idx < 0)
+   {
+      int n = (int)ArraySize(m_states);
+      ArrayResize(m_states, n + 1);
+      m_states[n] = TradeState(ticket);
+      m_states[n].target1Hit = hit;
+   }
+   else
+      m_states[idx].target1Hit = hit;
+}
+
+// FIX: Aggiunto IsTarget2Hit / SetTarget2Hit
+bool CTradeManager::IsTarget2Hit(ulong ticket) const
+{
+   int idx = FindStateIndex(ticket);
+   return (idx >= 0 && m_states[idx].target2Hit);
+}
+
+void CTradeManager::SetTarget2Hit(ulong ticket, bool hit)
+{
+   int idx = FindStateIndex(ticket);
+   if(idx < 0)
+   {
+      int n = (int)ArraySize(m_states);
+      ArrayResize(m_states, n + 1);
+      m_states[n] = TradeState(ticket);
+      m_states[n].target2Hit = hit;
+   }
+   else
+      m_states[idx].target2Hit = hit;
+}
+
+bool CTradeManager::IsBreakevenDone(ulong ticket) const
+{
+   int idx = FindStateIndex(ticket);
+   return (idx >= 0 && m_states[idx].breakevenDone);
+}
+
+void CTradeManager::SetBreakevenDone(ulong ticket, bool done)
+{
+   int idx = FindStateIndex(ticket);
+   if(idx < 0)
+   {
+      int n = (int)ArraySize(m_states);
+      ArrayResize(m_states, n + 1);
+      m_states[n] = TradeState(ticket);
+      m_states[n].breakevenDone = done;
+   }
+   else
+      m_states[idx].breakevenDone = done;
+}
+
+double CTradeManager::NormalizeLots(double lots)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lots = MathFloor(lots / lotStep) * lotStep;
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   
+   double marginRequired;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, 
+                       SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginRequired))
+      return 0.0;
+   
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(marginRequired > freeMargin * 0.95)
+   {
+      lots = lots * (freeMargin * 0.95 / marginRequired);
+      lots = MathFloor(lots / lotStep) * lotStep;
+      lots = MathMax(minLot, lots);
+   }
+   return lots;
+}
+
+double CTradeManager::CalculateLotSize(double slDistance, double atr)
+{
+   double lots = InpFixedLots;
+   
+   switch(InpMMMode)
+   {
+      case MM_FIXED:
+         lots = InpFixedLots;
+         break;
+         
+      case MM_PERCENT_RISK:
+      {
+         double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+         double riskAmount = balance * (InpRiskPercent / 100.0);
+         double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+         double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+         
+         if(tickValue > 0 && tickSize > 0 && slDistance > 0)
+         {
+            double ticksAtRisk = slDistance / tickSize;
+            lots = riskAmount / (ticksAtRisk * tickValue);
+         }
+         break;
+      }
+      
+      case MM_KELLY_HALF:
+      {
+         double kellyPct = (InpKellyWinRate * InpKellyPayoff - (1 - InpKellyWinRate)) / InpKellyPayoff;
+         kellyPct = MathMax(0, kellyPct) * 0.5;
+         
+         double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+         double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+         double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+         
+         if(tickValue > 0 && tickSize > 0 && slDistance > 0)
+         {
+            double ticksAtRisk = slDistance / tickSize;
+            lots = (balance * kellyPct) / (ticksAtRisk * tickValue);
+         }
+         break;
+      }
+   }
+   return NormalizeLots(lots);
+}
+
+string CTradeManager::BuildComment(ENUM_SIGNAL_SETUP setup, ENUM_DIR dir, 
+                                   int anchorIdx, int t1, int t2, int t3,
+                                   const string &openDate)
+{
+   // Formato breve per stare sotto i 31 char di MT5: "ELS|s|d|a|t1|t2|t3|YYYYMMDD"
+   // Esempio: "ELS|2|-1|7|6|5|4|20260204" = 25 chars max
+   string shortDate = openDate;
+   StringReplace(shortDate, "-", ""); // "2026-02-04" -> "20260204"
+   return "ELS|" + IntegerToString((int)setup) + "|" + IntegerToString((int)dir) + "|" +
+          IntegerToString(anchorIdx) + "|" + IntegerToString(t1) + "|" +
+          IntegerToString(t2) + "|" + IntegerToString(t3) + "|" + shortDate;
+}
+
+bool CTradeManager::ParseComment(const string &comment, ENUM_SIGNAL_SETUP &setup,
+                                  ENUM_DIR &dir, int &anchorIdx, int &t1, int &t2, int &t3,
+                                  string &openDate)
+{
+   string parts[];
+   int n = StringSplit(comment, '|', parts);
+   if(n < 8 || parts[0] != "ELS") return false;
+   
+   setup   = (ENUM_SIGNAL_SETUP)StringToInteger(parts[1]);
+   dir     = (ENUM_DIR)StringToInteger(parts[2]);
+   anchorIdx = (int)StringToInteger(parts[3]);
+   t1      = (int)StringToInteger(parts[4]);
+   t2      = (int)StringToInteger(parts[5]);
+   t3      = (int)StringToInteger(parts[6]);
+   // Riconverti YYYYMMDD -> YYYY-MM-DD
+   string d = parts[7];
+   if(StringLen(d) == 8)
+      openDate = StringSubstr(d,0,4) + "-" + StringSubstr(d,4,2) + "-" + StringSubstr(d,6,2);
+   else
+      openDate = d; // fallback per commenti vecchi con data già formattata
+   return true;
+}
+
+void CTradeManager::DrawTradeLevels(ulong ticket, ENUM_SIGNAL_SETUP setup, ENUM_DIR dir,
+                                     int anchorIdx, int t1, int t2, int t3)
+{
+   if(!EnableTradeDrawing) return;
+   
+   color clr = (setup == SETUP_REJECTION ? clrOrange : clrPurple);
+   string base = "ELS_TRADE_" + IntegerToString(ticket) + "_";
+   
+   if(!PositionSelectByTicket(ticket)) return;
+   
+   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+   
+   ObjectCreate(0, base + "ENTRY", OBJ_HLINE, 0, 0, entry);
+   ObjectSetInteger(0, base + "ENTRY", OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, base + "ENTRY", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, base + "ENTRY", OBJPROP_WIDTH, 2);
+}
+
+void CTradeManager::DeleteTradeLevels(ulong ticket)
+{
+   string base = "ELS_TRADE_" + IntegerToString(ticket) + "_";
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string nm = ObjectName(0, i);
+      if(StringFind(nm, base) == 0)
+         ObjectDelete(0, nm);
+   }
+}
+
+bool CTradeManager::Open(const SignalResult &sig, const CLevelManager &levels, double atr, const string &openDate)
+{
+   if(!sig.valid) return false;
+   
+   // ReversalMode: inverte la direzione del segnale prima di qualsiasi calcolo.
+   // SELL diventa BUY e viceversa. SL/TP/entry vengono calcolati sulla direzione invertita.
+   // Usare SOLO per test/ricerca — non in live trading senza validazione statistica.
+   SignalResult effectiveSig = sig;
+   if(ReversalMode)
+      effectiveSig.dir = (sig.dir == DIR_SELL) ? DIR_BUY : DIR_SELL;
+   
+   datetime barTime = iTime(_Symbol, InpSignalTF, 0);
+   if(g_lastTradeBarTime == barTime) return false;
+   
+   int openCount = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong t = PositionGetTicket(i);
+      if(t == 0) continue;
+      if(!PositionSelectByTicket(t)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((long)(long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+      // Escludi le posizioni hedge dal conteggio MaxSimultaneousTrades
+      string posComment = PositionGetString(POSITION_COMMENT);
+      if(StringFind(posComment, "ELS_HEDGE") >= 0) continue;
+      openCount++;
+   }
+   
+   if(openCount >= MaxSimultaneousTrades) return false;
+   
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double entry = (effectiveSig.dir == DIR_BUY ? ask : bid);
+   
+   // Calcola i target partendo dal livello più vicino all'ENTRY REALE,
+   // non dall'anchor del segnale. Il segnale può essere rilevato su una
+   // barra precedente, mentre l'entry avviene tick dopo a un prezzo diverso.
+   // Es: segnale su close a 4851, entry eseguita a 5047 → target da 5044, non da 4851.
+   int effectiveAnchorIdx = levels.FindNearestToPrice(entry);
+   if(effectiveAnchorIdx < 0) effectiveAnchorIdx = effectiveSig.anchorIdx;
+   
+   int t1, t2, t3;
+   // Prova prima dall'entry level; se non va (es. siamo al bordo della griglia),
+   // fallback sull'anchor originale del segnale
+   if(!levels.BuildTargets(effectiveSig.dir, effectiveAnchorIdx, t1, t2, t3))
+      if(!levels.BuildTargets(effectiveSig.dir, effectiveSig.anchorIdx, t1, t2, t3)) return false;
+   
+   double anchorPrice = levels.Get(effectiveAnchorIdx);
+   double t1Price = (t1 >= 0 ? levels.Get(t1) : 0.0);
+   double t2Price = (t2 >= 0 ? levels.Get(t2) : 0.0);
+   double t3Price = (t3 >= 0 ? levels.Get(t3) : 0.0);
+   
+   // Usa effectiveAnchorIdx come anchor nel commento (per recupero corretto)
+   int anchorIdxForComment = effectiveAnchorIdx;
+   
+   double levelBuf = LevelBufferPoints * g_point;
+   double minSLDist = MinInitialSLPoints * g_point;
+   double freezeDist = g_freezeLevelPoints * g_point;
+   
+   // Per il calcolo SL usiamo il livello sul LATO PERDENTE rispetto all'entry:
+   // BUY → il livello più alto SOTTO l'entry (supporto da proteggere)
+   // SELL → il livello più basso SOPRA l'entry (resistenza da proteggere)
+   // Con UseHedgeProtection: il hedge order va a L+1, lo SL della posizione va a L+2.
+   double slLevelPrice  = 0.0; // L+1 (hedge trigger / SL classico)
+   double slLevelPrice2 = 0.0; // L+2 (SL reale con hedge attivo)
+   if(effectiveSig.dir == DIR_BUY)
+   {
+      // Cerca i due livelli più alti SOTTO entry
+      int found = 0;
+      for(int _k = levels.Count() - 1; _k >= 0; _k--)
+      {
+         if(levels.Get(_k) < entry - levelBuf)
+         {
+            if(found == 0) { slLevelPrice  = levels.Get(_k); found++; }
+            else           { slLevelPrice2 = levels.Get(_k); break; }
+         }
+      }
+      if(slLevelPrice  <= 0) slLevelPrice  = levels.Get(effectiveAnchorIdx > 0 ? effectiveAnchorIdx - 1 : 0);
+      if(slLevelPrice2 <= 0) slLevelPrice2 = slLevelPrice; // fallback: stesso livello
+   }
+   else
+   {
+      // Cerca i due livelli più bassi SOPRA entry
+      int found = 0;
+      for(int _k = 0; _k < levels.Count(); _k++)
+      {
+         if(levels.Get(_k) > entry + levelBuf)
+         {
+            if(found == 0) { slLevelPrice  = levels.Get(_k); found++; }
+            else           { slLevelPrice2 = levels.Get(_k); break; }
+         }
+      }
+      if(slLevelPrice  <= 0) slLevelPrice  = levels.Get(effectiveAnchorIdx + 1 < levels.Count() ? effectiveAnchorIdx + 1 : effectiveAnchorIdx);
+      if(slLevelPrice2 <= 0) slLevelPrice2 = slLevelPrice; // fallback: stesso livello
+   }
+   
+   // Con hedge attivo usa L+2 come SL effettivo della posizione
+   double effectiveSLLevel = UseHedgeProtection ? slLevelPrice2 : slLevelPrice;
+   
+   double sl = 0.0;
+   if(effectiveSig.dir == DIR_BUY)
+   {
+      // SL = il più conservativo tra: distanza minima da entry e livello sotto l'entry
+      // Con UseHedgeProtection: effectiveSLLevel = L+2 (hedge a L+1 fa da primo paracadute)
+      double slFromMinDist = entry - minSLDist - freezeDist;
+      double slFromLevel   = (effectiveSLLevel > 0 ? effectiveSLLevel - levelBuf - freezeDist : slFromMinDist);
+      sl = MathMax(slFromMinDist, slFromLevel); // MathMax = più vicino all'entry (più stretto)
+      if(sl >= entry - 10 * g_point) sl = entry - 10 * g_point;
+   }
+   else
+   {
+      double slFromMinDist = entry + minSLDist + freezeDist;
+      double slFromLevel   = (effectiveSLLevel > 0 ? effectiveSLLevel + levelBuf + freezeDist : slFromMinDist);
+      sl = MathMin(slFromMinDist, slFromLevel); // MathMin = più vicino all'entry (più stretto)
+      if(sl <= entry + 10 * g_point) sl = entry + 10 * g_point;
+   }
+   
+   // FIX 3: TP SEMPRE su T3 se disponibile, altrimenti T2, altrimenti T1
+   // Non viene più riscritto da ManagePositions se già valido
+   double tp = 0.0;
+   if(t3 >= 0 && t3Price > 0)      tp = t3Price;
+   else if(t2 >= 0 && t2Price > 0) tp = t2Price;
+   else if(t1 >= 0 && t1Price > 0) tp = t1Price;
+   
+   double minDist = MathMax(g_stopsLevelPoints, g_freezeLevelPoints) * g_point;
+   
+   if(effectiveSig.dir == DIR_BUY)
+   {
+      if(sl >= entry - minDist) sl = entry - minDist - 2 * g_point;
+      if(tp > 0 && tp <= entry + minDist) tp = entry + minDist + 2 * g_point;
+   }
+   else
+   {
+      if(sl <= entry + minDist) sl = entry + minDist + 2 * g_point;
+      if(tp > 0 && tp >= entry - minDist) tp = entry - minDist - 2 * g_point;
+   }
+   
+   sl = NormalizeDouble(sl, g_digits);
+   tp = NormalizeDouble(tp, g_digits);
+   
+   double slDist = MathAbs(entry - sl);
+   double lots = CalculateLotSize(slDist, atr);
+   if(lots <= 0) return false;
+   
+   string comment = BuildComment(effectiveSig.setup, effectiveSig.dir, anchorIdxForComment, t1, t2, t3, openDate);
+   
+   bool ok = (effectiveSig.dir == DIR_BUY) ? 
+             m_trade.Buy(lots, _Symbol, 0.0, sl, tp, comment) :
+             m_trade.Sell(lots, _Symbol, 0.0, sl, tp, comment);
+   
+   if(!ok) return false;
+   
+   ulong newTicket = m_trade.ResultOrder();
+   
+   LogEx(LOG_INFO, StringFormat(
+      "Open %s #%I64u: entry=%.2f anchorLvl=%.2f T1=%.2f T2=%.2f T3=%.2f SL=%.2f TP=%.2f",
+      (effectiveSig.dir==DIR_BUY?"BUY":"SELL"), newTicket,
+      entry, anchorPrice, t1Price, t2Price, t3Price, sl, tp), "OPEN");
+   
+   // HEDGE PROTECTION: piazza il BUY/SELL STOP al livello L+1 con stessa size
+   if(UseHedgeProtection && slLevelPrice > 0)
+   {
+      ulong hTicket = PlaceHedgeOrder(effectiveSig.dir, slLevelPrice, lots);
+      // Salva il ticket hedge nello stato della posizione
+      int si = (int)m_states.Size();
+      // Lo stato viene aggiunto dalla logica standard, aggiorniamo dopo
+      // Usiamo un array globale temporaneo per associare ticket→hedgeTicket
+      // (lo stato viene popolato in OnTradeTransaction)
+      // Salviamo in un buffer pending da applicare al prossimo FindState
+      if(hTicket > 0)
+      {
+         // Cerca lo stato appena aggiunto e assegna hedgeTicket
+         for(int _si = (int)ArraySize(m_states)-1; _si >= 0; _si--)
+         {
+            if(m_states[_si].ticket == newTicket)
+            {
+               m_states[_si].hedgeTicket = hTicket;
+               LogEx(LOG_INFO, StringFormat("Hedge #%I64u associato a posizione #%I64u", hTicket, newTicket), "HEDGE");
+               break;
+            }
+         }
+      }
+   }
+   
+   g_lastTradeBarTime = barTime;
+   g_stats.tradesOpened++;
+   
+   DrawTradeLevels(newTicket, effectiveSig.setup, effectiveSig.dir, anchorIdxForComment, t1, t2, t3);
+   return true;
+}
+
+bool CTradeManager::ModifySLTP(ulong ticket, double sl, double tp)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   
+   double oldSL = PositionGetDouble(POSITION_SL);
+   double oldTP = PositionGetDouble(POSITION_TP);
+   
+   if(MathAbs(oldSL - sl) < 2 * g_point && MathAbs(oldTP - tp) < 2 * g_point)
+      return true;
+   
+   bool ok = m_trade.PositionModify(ticket, sl, tp);
+   if(!ok)
+      LogEx(LOG_ERROR, StringFormat(
+         "ModifySLTP FAILED #%I64u: SL %.2f→%.2f TP %.2f→%.2f | retcode=%d err=%d ask=%.2f bid=%.2f",
+         ticket, oldSL, sl, oldTP, tp,
+         m_trade.ResultRetcode(),
+         GetLastError(),
+         SymbolInfoDouble(_Symbol, SYMBOL_ASK),
+         SymbolInfoDouble(_Symbol, SYMBOL_BID)), "SL");
+   else
+      LogEx(LOG_INFO, StringFormat(
+         "ModifySLTP OK #%I64u: SL %.2f→%.2f TP=%.2f",
+         ticket, oldSL, sl, tp), "SL");
+   return ok;
+}
+
+bool CTradeManager::ClosePartial(ulong ticket, double volume)
+{
+   return (volume > 0) ? m_trade.PositionClosePartial(ticket, volume) : false;
+}
+
+bool CTradeManager::CloseFull(ulong ticket)
+{
+   bool ok = m_trade.PositionClose(ticket);
+   if(ok) DeleteTradeObjects(ticket);
+   return ok;
+}
+
+void CTradeManager::DeleteTradeObjects(ulong ticket)
+{
+   if(!EnableTradeDrawing) return;
+   string prefix = "ELS_TRADE_" + IntegerToString(ticket) + "_";
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string nm = ObjectName(0, i);
+      if(StringFind(nm, prefix) == 0)
+         ObjectDelete(0, nm);
+   }
+}
+
+void CTradeManager::ManagePositions(const CLevelManager &levels, CDataCache &cache, 
+                                     PerformanceStats &stats)
+{
+   CleanupStates();
+   if(PositionsTotal() <= 0) return;
+   
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double atr = cache.GetLatestATR();
+   
+   string todayYMD = TimeToString(TimeCurrent(), TIME_DATE);
+   StringReplace(todayYMD, ".", "-");
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol || 
+         (long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber)
+         continue;
+      
+      long type = PositionGetInteger(POSITION_TYPE);
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+      double profit = PositionGetDouble(POSITION_PROFIT);
+      string comment = PositionGetString(POSITION_COMMENT);
+      
+      ENUM_SIGNAL_SETUP setup; ENUM_DIR dir;
+      int anchorIdx, t1, t2, t3;
+      string openDate;
+      
+      if(!ParseComment(comment, setup, dir, anchorIdx, t1, t2, t3, openDate)) continue;
+      if(dir == DIR_NONE || anchorIdx < 0) continue;
+      
+      // =====================================================================
+      // LOOKUP PREZZI DEI LIVELLI:
+      // Usiamo sempre GetLevelsForDate(openDate) come fonte primaria — funziona
+      // sia per il giorno corrente che per quelli storici.
+      // Se la data non è nel database, usiamo i livelli correnti come fallback.
+      // =====================================================================
+      double effectiveAnchorPrice = 0.0;
+      double effectiveT1Price     = 0.0;
+      double effectiveT2Price     = 0.0;
+      double effectiveT3Price     = 0.0;
+      
+      double dayLevels[];
+      if(levels.GetLevelsForDate(openDate, dayLevels))
+      {
+         // CRITICO: GetLevelsForDate restituisce i livelli nell'ordine hardcoded
+         // (discendente), ma gli indici nel commento si riferiscono all'array
+         // ORDINATO ASCENDENTE (come fa LoadForDate). Bisogna ordinare prima.
+         int nLvl = (int)ArraySize(dayLevels);
+         for(int _i = 0; _i < nLvl - 1; _i++)
+            for(int _j = _i + 1; _j < nLvl; _j++)
+               if(dayLevels[_i] > dayLevels[_j])
+               { double _tmp = dayLevels[_i]; dayLevels[_i] = dayLevels[_j]; dayLevels[_j] = _tmp; }
+         
+         if(anchorIdx >= 0 && anchorIdx < nLvl) effectiveAnchorPrice = dayLevels[anchorIdx];
+         if(t1 >= 0 && t1 < nLvl) effectiveT1Price = dayLevels[t1];
+         if(t2 >= 0 && t2 < nLvl) effectiveT2Price = dayLevels[t2];
+         if(t3 >= 0 && t3 < nLvl) effectiveT3Price = dayLevels[t3];
+      }
+      
+      // Fallback: se i prezzi non sono stati trovati, recuperali dai livelli CORRENTI
+      // usando il prezzo corrente come riferimento (non l'entry, che potrebbe essere
+      // molto lontano dal mercato attuale).
+      if(effectiveT1Price <= 0 || (effectiveT3Price <= 0 && t3 >= 0) || tp == 0.0)
+      {
+         double refPrice = (type == POSITION_TYPE_BUY ? bid : ask);
+         int nearIdx = levels.FindNearestToPrice(refPrice);
+         if(nearIdx >= 0)
+         {
+            int ct1, ct2, ct3;
+            if(levels.BuildTargets(dir, nearIdx, ct1, ct2, ct3))
+            {
+               if(effectiveT1Price <= 0 && ct1 >= 0) effectiveT1Price = levels.Get(ct1);
+               if(effectiveT2Price <= 0 && ct2 >= 0) effectiveT2Price = levels.Get(ct2);
+               if(effectiveT3Price <= 0 && ct3 >= 0) effectiveT3Price = levels.Get(ct3);
+               
+               if(tp == 0.0)
+               {
+                  double recoveredTP = 0.0;
+                  if(ct3 >= 0) recoveredTP = levels.Get(ct3);
+                  else if(ct2 >= 0) recoveredTP = levels.Get(ct2);
+                  else if(ct1 >= 0) recoveredTP = levels.Get(ct1);
+                  
+                  if(recoveredTP > 0.0)
+                  {
+                     bool validTP = (dir == DIR_BUY  && recoveredTP > refPrice) ||
+                                    (dir == DIR_SELL && recoveredTP < refPrice);
+                     if(validTP)
+                     {
+                        recoveredTP = NormalizeDouble(recoveredTP, g_digits);
+                        if(ModifySLTP(ticket, sl, recoveredTP))
+                        {
+                           tp = recoveredTP;
+                           LogEx(LOG_INFO, StringFormat(
+                              "Recovered TP #%I64u: entry=%.2f curr=%.2f nearLvl=%.2f TP=%.2f",
+                              ticket, entry, refPrice, levels.Get(nearIdx), recoveredTP), "RECOVER");
+                        }
+                     }
+                  }
+               }
+            }
+         }
+      }
+      
+      // =====================================================================
+      // SANITY CHECK: annulla i target che sono dalla parte sbagliata dell'entry.
+      // Un BUY deve avere T1/T2/T3 > entry, un SELL deve averli < entry.
+      // Questo previene l'emergency close immediato quando il fallback recovery
+      // assegna livelli scorretti (es. BUY con T3 sotto l'entry).
+      // =====================================================================
+      if(dir == DIR_BUY)
+      {
+         if(effectiveT1Price > 0 && effectiveT1Price <= entry) { effectiveT1Price = 0; effectiveT2Price = 0; effectiveT3Price = 0; }
+         else if(effectiveT2Price > 0 && effectiveT2Price <= entry) { effectiveT2Price = 0; effectiveT3Price = 0; }
+         else if(effectiveT3Price > 0 && effectiveT3Price <= entry) { effectiveT3Price = 0; }
+      }
+      else // DIR_SELL
+      {
+         if(effectiveT1Price > 0 && effectiveT1Price >= entry) { effectiveT1Price = 0; effectiveT2Price = 0; effectiveT3Price = 0; }
+         else if(effectiveT2Price > 0 && effectiveT2Price >= entry) { effectiveT2Price = 0; effectiveT3Price = 0; }
+         else if(effectiveT3Price > 0 && effectiveT3Price >= entry) { effectiveT3Price = 0; }
+      }
+      
+      LogEx(LOG_DEBUG, StringFormat(
+         "Pos #%I64u %s | entry=%.2f | T1=%.2f T2=%.2f T3=%.2f | SL=%.2f TP=%.2f",
+         ticket, (dir==DIR_BUY?"BUY":"SELL"), entry,
+         effectiveT1Price, effectiveT2Price, effectiveT3Price, sl, tp), "MANAGE");
+      
+      double current = (type == POSITION_TYPE_BUY ? bid : ask);
+      
+      // =====================================================================
+      // FIX C: CHIUSURA DI EMERGENZA se il prezzo è andato oltre T3 ma non è
+      // stato chiuso (gap, TP mancante, o T3 non era impostato).
+      // Controlla anche T1 e T2 come fallback se T3 non è disponibile.
+      // =====================================================================
+      
+      // Calcola l'età della posizione in minuti
+      datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+      int posAgeMinutes = (int)((TimeCurrent() - openTime) / 60);
+      bool inGracePeriod = (GracePeriodMinutes > 0 && posAgeMinutes < GracePeriodMinutes);
+      
+      if(!inGracePeriod)
+      {
+         // Emergency close: scatta solo fuori dalla finestra di grazia
+         // e solo se il profitto minimo è soddisfatto (se impostato)
+         bool emergencyClose = false;
+         string emergencyReason = "";
+         
+         bool profitOK = (MinProfitForEmergencyClose <= 0.0 || profit >= MinProfitForEmergencyClose);
+         
+         if(profitOK)
+         {
+            if(effectiveT3Price > 0)
+            {
+               if((dir == DIR_BUY  && current >= effectiveT3Price) ||
+                  (dir == DIR_SELL && current <= effectiveT3Price))
+               {
+                  emergencyClose = true;
+                  emergencyReason = StringFormat("T3 manual close (gap/missing TP): price=%.2f T3=%.2f", current, effectiveT3Price);
+               }
+            }
+            else if(effectiveT2Price > 0 && effectiveT3Price <= 0)
+            {
+               if((dir == DIR_BUY  && current >= effectiveT2Price) ||
+                  (dir == DIR_SELL && current <= effectiveT2Price))
+               {
+                  emergencyClose = true;
+                  emergencyReason = StringFormat("T2 close (no T3 available): price=%.2f T2=%.2f", current, effectiveT2Price);
+               }
+            }
+            else if(effectiveT1Price > 0 && effectiveT2Price <= 0 && effectiveT3Price <= 0)
+            {
+               if((dir == DIR_BUY  && current >= effectiveT1Price) ||
+                  (dir == DIR_SELL && current <= effectiveT1Price))
+               {
+                  emergencyClose = true;
+                  emergencyReason = StringFormat("T1 close (no T2/T3 available): price=%.2f T1=%.2f", current, effectiveT1Price);
+               }
+            }
+         }
+         
+         if(emergencyClose)
+         {
+            LogEx(LOG_INFO, StringFormat("Emergency close #%I64u: %s", ticket, emergencyReason), "MANAGE");
+            if(CloseFull(ticket))
+            {
+               stats.grossProfit += profit;
+               stats.tradesClosed++;
+               continue;
+            }
+         }
+      }
+      else
+      {
+         LogEx(LOG_DEBUG, StringFormat(
+            "Grace period #%I64u: age=%dm/%dm — emergency close e trailing sospesi",
+            ticket, posAgeMinutes, GracePeriodMinutes), "MANAGE");
+      }
+      
+      // =====================================================================
+      // Exit su segnale RSI opposto (solo se in profitto)
+      // =====================================================================
+      if(UseOppositeDivergenceExit && profit > 0.0)
+      {
+         bool exitSignal = (dir == DIR_BUY && cache.IsCrossDown(1) && cache.GetRSI(1) > RSI_OB) ||
+                          (dir == DIR_SELL && cache.IsCrossUp(1) && cache.GetRSI(1) < RSI_OS);
+         
+         if(exitSignal && CloseFull(ticket))
+         {
+            stats.grossProfit += profit;
+            stats.tradesClosed++;
+            continue;
+         }
+      }
+      
+      // =====================================================================
+      // HEDGE PROTECTION: eseguito SEMPRE, anche durante grace period
+      // Il hedge deve poter ripiazzare ordini e spostare SL a BE indipendentemente
+      // =====================================================================
+      if(UseHedgeProtection && !IsTarget1Hit(ticket))
+      {
+         int _hsi = FindStateIndex(ticket);
+         if(_hsi >= 0)
+         {
+            double levelBuf = LevelBufferPoints * g_point;
+            double hTrigger = 0.0;
+            if(dir == DIR_SELL)
+            {
+               for(int _lk = 0; _lk < levels.Count(); _lk++)
+                  if(levels.Get(_lk) > entry + levelBuf) { hTrigger = levels.Get(_lk); break; }
+            }
+            else
+            {
+               for(int _lk = levels.Count()-1; _lk >= 0; _lk--)
+                  if(levels.Get(_lk) < entry - levelBuf) { hTrigger = levels.Get(_lk); break; }
+            }
+            if(hTrigger > 0)
+            {
+               ManageHedgePosition(m_states[_hsi].hedgeTicket, dir, hTrigger, vol);
+               
+               // Se prezzo raggiunge livello successivo al trigger → chiudi tutto
+               double nextLevel = 0.0;
+               if(dir == DIR_SELL)
+               {
+                  for(int _nl = 0; _nl < levels.Count(); _nl++)
+                     if(levels.Get(_nl) > hTrigger + levelBuf) { nextLevel = levels.Get(_nl); break; }
+                  if(nextLevel > 0 && current >= nextLevel - levelBuf)
+                  {
+                     LogEx(LOG_INFO, StringFormat("Hedge: prezzo %.2f >= livello successivo %.2f — chiudo tutto", current, nextLevel), "HEDGE");
+                     if(PositionSelectByTicket(m_states[_hsi].hedgeTicket))
+                     { CTrade _ct; _ct.SetExpertMagicNumber(InpMagicNumber); _ct.PositionClose(m_states[_hsi].hedgeTicket); }
+                     else if(OrderSelect(m_states[_hsi].hedgeTicket))
+                        CancelHedgeOrder(m_states[_hsi].hedgeTicket);
+                     m_states[_hsi].hedgeTicket = 0;
+                     CTrade _ct2; _ct2.SetExpertMagicNumber(InpMagicNumber);
+                     _ct2.PositionClose(ticket);
+                     continue;
+                  }
+               }
+               else
+               {
+                  for(int _nl = levels.Count()-1; _nl >= 0; _nl--)
+                     if(levels.Get(_nl) < hTrigger - levelBuf) { nextLevel = levels.Get(_nl); break; }
+                  if(nextLevel > 0 && current <= nextLevel + levelBuf)
+                  {
+                     LogEx(LOG_INFO, StringFormat("Hedge: prezzo %.2f <= livello successivo %.2f — chiudo tutto", current, nextLevel), "HEDGE");
+                     if(PositionSelectByTicket(m_states[_hsi].hedgeTicket))
+                     { CTrade _ct; _ct.SetExpertMagicNumber(InpMagicNumber); _ct.PositionClose(m_states[_hsi].hedgeTicket); }
+                     else if(OrderSelect(m_states[_hsi].hedgeTicket))
+                        CancelHedgeOrder(m_states[_hsi].hedgeTicket);
+                     m_states[_hsi].hedgeTicket = 0;
+                     CTrade _ct2; _ct2.SetExpertMagicNumber(InpMagicNumber);
+                     _ct2.PositionClose(ticket);
+                     continue;
+                  }
+               }
+            }
+         }
+      }
+      
+      // =====================================================================
+      // Gestione SL dinamico (trailing a scalini sui livelli)
+      // Sospeso durante il grace period per evitare BE immediato
+      // =====================================================================
+      if(inGracePeriod)
+      {
+         // Durante il grace period salta il trailing SL, ma gestisce il hedge
+         if(UseHedgeProtection && !IsTarget1Hit(ticket))
+         {
+            int _hsi = FindStateIndex(ticket);
+            if(_hsi >= 0)
+            {
+               double levelBuf = LevelBufferPoints * g_point;
+               double hTrigger = 0.0;
+               if(dir == DIR_SELL)
+               {
+                  for(int _lk = 0; _lk < levels.Count(); _lk++)
+                     if(levels.Get(_lk) > entry + levelBuf) { hTrigger = levels.Get(_lk); break; }
+               }
+               else
+               {
+                  for(int _lk = levels.Count()-1; _lk >= 0; _lk--)
+                     if(levels.Get(_lk) < entry - levelBuf) { hTrigger = levels.Get(_lk); break; }
+               }
+               if(hTrigger > 0)
+                  ManageHedgePosition(m_states[_hsi].hedgeTicket, dir, hTrigger, vol);
+            }
+         }
+         continue;
+      }
+      
+      double newSL = sl;
+      // FIX 3: Il TP NON viene riscritto da ManagePositions se già impostato (tp > 0)
+      // Viene riscritto solo se tp==0 (e in quel caso usa effectiveT3Price oppure T1)
+      double newTP = (tp > 0.0) ? tp : 
+                     NormalizeDouble((effectiveT3Price > 0 ? effectiveT3Price : effectiveT1Price), g_digits);
+      
+      if(dir == DIR_BUY)
+      {
+         // Step 1: Superato T1 → registra hit
+         if(effectiveT1Price > 0 && current >= effectiveT1Price && !IsTarget1Hit(ticket))
+         {
+            SetTarget1Hit(ticket, true);
+            LogEx(LOG_INFO, StringFormat("T1 Hit BUY #%I64u: price=%.2f T1=%.2f", ticket, current, effectiveT1Price), "SL");
+            // HEDGE: T1 raggiunto → cancella il BUY/SELL STOP hedge, da qui la vecchia logica gestisce
+            if(UseHedgeProtection)
+            {
+               int _hsi = FindStateIndex(ticket);
+               if(_hsi >= 0 && m_states[_hsi].hedgeTicket != 0)
+                  CancelHedgeOrder(m_states[_hsi].hedgeTicket);
+            }
+         }
+         
+         // Step 2: Superato T1 → SL a Breakeven (entry + buffer)
+         if(IsTarget1Hit(ticket) && !IsBreakevenDone(ticket))
+         {
+            double beLevel = NormalizeDouble(entry + BreakevenBufferPoints * g_point, g_digits);
+            if(beLevel > newSL)
+            {
+               newSL = beLevel;
+               SetBreakevenDone(ticket, true);
+               LogEx(LOG_INFO, StringFormat("BE set BUY #%I64u: entry=%.2f BE=%.2f (was SL=%.2f)", ticket, entry, newSL, sl), "SL");
+            }
+         }
+         
+         // Step 3: Chiusura parziale a T1
+         if(UsePartialCloseAtTarget1 && !IsPartialDone(ticket) && 
+            effectiveT1Price > 0 && current >= effectiveT1Price)
+         {
+            double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+            double minVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+            double closeVol = vol * (PartialClosePercent / 100.0);
+            closeVol = MathFloor(closeVol / volStep) * volStep;
+            
+            if(closeVol >= minVol && closeVol < vol)
+               ClosePartial(ticket, closeVol);
+            SetPartialDone(ticket, true);
+         }
+         
+         // FIX 1: Superato T2 → SL su T1 (lock profitto T1)
+         // Prima era: "a metà strada tra T1 e T2" — ora è al superamento effettivo di T2
+         if(effectiveT2Price > 0 && current >= effectiveT2Price && !IsTarget2Hit(ticket))
+         {
+            SetTarget2Hit(ticket, true);
+            double slAtT1 = NormalizeDouble(effectiveT1Price, g_digits);
+            if(slAtT1 > newSL)
+            {
+               newSL = slAtT1;
+               LogEx(LOG_INFO, StringFormat("T2 Hit SELL #%I64u: price=%.2f T2=%.2f → newSL=%.2f (T1)", ticket, current, effectiveT2Price, newSL), "SL");
+            }
+         }
+         
+         // Mantieni SL su T1 anche se già segnato (protezione da oscillazioni)
+         if(IsTarget2Hit(ticket) && effectiveT1Price > 0)
+            newSL = MathMax(newSL, NormalizeDouble(effectiveT1Price, g_digits));
+         
+         // FIX 2: Superato T3 → SL su T2 (lock profitto T2)
+         // Prima era: "a metà strada tra T2 e T3" — ora al superamento di T3
+         // (in realtà T3 dovrebbe essere già chiuso dal broker/manuale sopra, 
+         //  ma se il prezzo ci arriva lentamente senza gap, questo protegge)
+         if(effectiveT3Price > 0 && current >= effectiveT3Price && effectiveT2Price > 0)
+         {
+            double slAtT2 = NormalizeDouble(effectiveT2Price, g_digits);
+            newSL = MathMax(newSL, slAtT2);
+         }
+         
+         // ATR Trailing attivo da T2 in su
+         if(UseATRTrailing && atr > 0.0 && effectiveT2Price > 0 && current >= effectiveT2Price)
+         {
+            double atrSL = NormalizeDouble(current - (atr * ATR_TrailMult), g_digits);
+            newSL = MathMax(newSL, atrSL);
+         }
+         
+         // Applica modifica SL solo se migliora (solo in su per BUY)
+         newSL = NormalizeDouble(newSL, g_digits);
+         if(newSL > 0.0 && (sl <= 0.0 || newSL > sl + 2 * g_point))
+            ModifySLTP(ticket, newSL, newTP);
+      }
+      else // DIR_SELL
+      {
+         // Step 1: Superato T1 (verso il basso) → registra hit
+         if(effectiveT1Price > 0 && current <= effectiveT1Price && !IsTarget1Hit(ticket))
+         {
+            SetTarget1Hit(ticket, true);
+            LogEx(LOG_INFO, StringFormat("T1 Hit SELL #%I64u: price=%.2f T1=%.2f", ticket, current, effectiveT1Price), "SL");
+            // HEDGE: T1 raggiunto → cancella il BUY/SELL STOP hedge, da qui la vecchia logica gestisce
+            if(UseHedgeProtection)
+            {
+               int _hsi = FindStateIndex(ticket);
+               if(_hsi >= 0 && m_states[_hsi].hedgeTicket != 0)
+                  CancelHedgeOrder(m_states[_hsi].hedgeTicket);
+            }
+         }
+         
+         // Step 2: Superato T1 → SL a Breakeven (entry + buffer, sopra entry per SELL)
+         if(IsTarget1Hit(ticket) && !IsBreakevenDone(ticket))
+         {
+            // Per SELL: SL deve essere SOPRA entry (protezione dal rialzo)
+            // Breakeven = entry + buffer = uscita a zero se il prezzo risale all'entry
+            double beLevel = NormalizeDouble(entry + BreakevenBufferPoints * g_point, g_digits);
+            if(newSL == 0.0 || beLevel < newSL)
+            {
+               newSL = beLevel;
+               SetBreakevenDone(ticket, true);
+               LogEx(LOG_INFO, StringFormat("BE set SELL #%I64u: entry=%.2f BE=%.2f (was SL=%.2f)", ticket, entry, newSL, sl), "SL");
+            }
+         }
+         
+         // Step 3: Chiusura parziale a T1
+         if(UsePartialCloseAtTarget1 && !IsPartialDone(ticket) && 
+            effectiveT1Price > 0 && current <= effectiveT1Price)
+         {
+            double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+            double minVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+            double closeVol = vol * (PartialClosePercent / 100.0);
+            closeVol = MathFloor(closeVol / volStep) * volStep;
+            
+            if(closeVol >= minVol && closeVol < vol)
+               ClosePartial(ticket, closeVol);
+            SetPartialDone(ticket, true);
+         }
+         
+         // FIX 1: Superato T2 (verso il basso) → SL su T1 (lock profitto T1)
+         if(effectiveT2Price > 0 && current <= effectiveT2Price && !IsTarget2Hit(ticket))
+         {
+            SetTarget2Hit(ticket, true);
+            double slAtT1 = NormalizeDouble(effectiveT1Price, g_digits);
+            if(newSL == 0.0 || slAtT1 < newSL)
+            {
+               newSL = slAtT1;
+               LogEx(LOG_INFO, StringFormat("T2 Hit SELL #%I64u: price=%.2f T2=%.2f → newSL=%.2f (T1)", ticket, current, effectiveT2Price, newSL), "SL");
+            }
+         }
+         
+         // Mantieni SL su T1 anche se già segnato
+         if(IsTarget2Hit(ticket) && effectiveT1Price > 0)
+         {
+            if(newSL == 0.0 || effectiveT1Price < newSL)
+               newSL = NormalizeDouble(effectiveT1Price, g_digits);
+         }
+         
+         // FIX 2: Superato T3 (verso il basso) → SL su T2
+         if(effectiveT3Price > 0 && current <= effectiveT3Price && effectiveT2Price > 0)
+         {
+            double slAtT2 = NormalizeDouble(effectiveT2Price, g_digits);
+            if(newSL == 0.0 || slAtT2 < newSL)
+               newSL = slAtT2;
+         }
+         
+         // ATR Trailing attivo da T2 in giù
+         if(UseATRTrailing && atr > 0.0 && effectiveT2Price > 0 && current <= effectiveT2Price)
+         {
+            double atrSL = NormalizeDouble(current + (atr * ATR_TrailMult), g_digits);
+            if(newSL == 0.0 || atrSL < newSL)
+               newSL = atrSL;
+         }
+         
+         // Applica modifica SL solo se migliora (solo in giù per SELL)
+         newSL = NormalizeDouble(newSL, g_digits);
+         if(newSL > 0.0 && (sl <= 0.0 || newSL < sl - 2 * g_point))
+            ModifySLTP(ticket, newSL, newTP);
+      }
+      
+   }
+}
+
+// ============================== SIGNAL DETECTION ===================
+bool CheckRejectionSignal(const CLevelManager &levels, CDataCache &cache, SignalResult &sig)
+{
+   sig = SignalResult();
+   if(!UseSetup_RejectionMomentum) return false;
+   
+   double touchBuf = TouchBufferPoints * g_point;
+   int levelIdx = levels.FindNearestNearToClose(1, touchBuf);
+   if(levelIdx < 0)
+   {
+      LogEx(LOG_DEBUG, StringFormat("REJ SKIP: nessun livello vicino a close=%.2f touchBuf=%.2f",
+         iClose(_Symbol,InpSignalTF,1), touchBuf), "REJ");
+      return false;
+   }
+   
+   double close1 = iClose(_Symbol, InpSignalTF, 1);
+   if(close1 == 0) return false;
+   
+   bool buyCross = cache.IsCrossUp(1);
+   bool sellCross = cache.IsCrossDown(1);
+   if(!buyCross && !sellCross)
+   {
+      LogEx(LOG_DEBUG, StringFormat("REJ SKIP: nessun crossover RSI | RSI[1]=%.2f SMA[1]=%.2f RSI[2]=%.2f SMA[2]=%.2f",
+         cache.GetRSI(1), cache.GetRSISMA(1), cache.GetRSI(2), cache.GetRSISMA(2)), "REJ");
+      return false;
+   }
+   
+   int aboveCount = 0, belowCount = 0;
+   int checkBars = MathMax(1, RejMinRSITrendBars);
+   
+   for(int i = 2; i < 2 + checkBars && i < 100; i++)
+   {
+      if(cache.GetRSI(i) > cache.GetRSISMA(i)) aboveCount++;
+      if(cache.GetRSI(i) < cache.GetRSISMA(i)) belowCount++;
+   }
+   
+   double levelBuf = LevelBufferPoints * g_point;
+   double level = levels.Get(levelIdx);
+   
+   LogEx(LOG_DEBUG, StringFormat(
+      "REJ CHECK: close=%.2f level=%.2f[%d] cross=%s aboveCount=%d belowCount=%d need=%d",
+      close1, level, levelIdx,
+      (sellCross?"SELL":"BUY"), aboveCount, belowCount, RejMinRSITrendBars), "REJ");
+   
+   if(AllowSell && sellCross && aboveCount >= RejMinRSITrendBars)
+   {
+      int attempts = 0;
+      for(int s = 2; s <= RejLookbackBars + 1 && s < 100; s++)
+      {
+         double h = iHigh(_Symbol, InpSignalTF, s);
+         double l = iLow(_Symbol, InpSignalTF, s);
+         double c = iClose(_Symbol, InpSignalTF, s);
+         if(h == 0 || l == 0 || c == 0) continue;
+         
+         bool touched = (l <= level + touchBuf && h >= level - touchBuf);
+         bool nearCtx = (MathAbs(c - level) <= levels.NearDistance(levelIdx));
+         
+         if(!touched && !nearCtx) continue;
+         if(c <= level + levelBuf) attempts++;
+      }
+      
+      LogEx(LOG_DEBUG, StringFormat("REJ SELL: attempts=%d min=%d max=%d", attempts, RejMinFailedAttempts, RejMaxFailedAttempts), "REJ");
+      if(attempts < RejMinFailedAttempts || attempts > RejMaxFailedAttempts)
+      {
+         LogEx(LOG_DEBUG, StringFormat("REJ SELL SKIP: attempts=%d fuori range [%d,%d]", attempts, RejMinFailedAttempts, RejMaxFailedAttempts), "REJ");
+         return false;
+      }
+      if(UseLevelCloseFilter && close1 >= level - levelBuf)
+      {
+         LogEx(LOG_DEBUG, StringFormat("REJ SELL SKIP: LevelCloseFilter close=%.2f >= level-buf=%.2f", close1, level-levelBuf), "REJ");
+         return false;
+      }
+      
+      if(RejRequireCurrentBarNearLvl)
+      {
+         bool nearNow = levels.IsNear(close1, levelIdx) || 
+                       levels.CandleTouches(1, levelIdx, touchBuf);
+         if(!nearNow)
+         {
+            LogEx(LOG_DEBUG, StringFormat("REJ SELL SKIP: barra corrente non vicina al livello close=%.2f level=%.2f nearDist=%.2f", close1, level, levels.NearDistance(levelIdx)), "REJ");
+            return false;
+         }
+      }
+      
+      sig.valid = true;
+      sig.dir = DIR_SELL;
+      sig.setup = SETUP_REJECTION;
+      sig.anchorIdx = levelIdx;
+      sig.reason = "Rejection SELL, attempts: " + IntegerToString(attempts);
+      return true;
+   }
+   else if(sellCross && aboveCount < RejMinRSITrendBars)
+      LogEx(LOG_DEBUG, StringFormat("REJ SELL SKIP: aboveCount=%d < minRSITrendBars=%d", aboveCount, RejMinRSITrendBars), "REJ");
+   
+   if(AllowBuy && buyCross && belowCount >= RejMinRSITrendBars)
+   {
+      int attempts = 0;
+      for(int s = 2; s <= RejLookbackBars + 1 && s < 100; s++)
+      {
+         double h = iHigh(_Symbol, InpSignalTF, s);
+         double l = iLow(_Symbol, InpSignalTF, s);
+         double c = iClose(_Symbol, InpSignalTF, s);
+         if(h == 0 || l == 0 || c == 0) continue;
+         
+         bool touched = (l <= level + touchBuf && h >= level - touchBuf);
+         bool nearCtx = (MathAbs(c - level) <= levels.NearDistance(levelIdx));
+         
+         if(!touched && !nearCtx) continue;
+         if(c >= level - levelBuf) attempts++;
+      }
+      
+      LogEx(LOG_DEBUG, StringFormat("REJ BUY: attempts=%d min=%d max=%d", attempts, RejMinFailedAttempts, RejMaxFailedAttempts), "REJ");
+      if(attempts < RejMinFailedAttempts || attempts > RejMaxFailedAttempts)
+      {
+         LogEx(LOG_DEBUG, StringFormat("REJ BUY SKIP: attempts=%d fuori range [%d,%d]", attempts, RejMinFailedAttempts, RejMaxFailedAttempts), "REJ");
+         return false;
+      }
+      if(UseLevelCloseFilter && close1 <= level + levelBuf)
+      {
+         LogEx(LOG_DEBUG, StringFormat("REJ BUY SKIP: LevelCloseFilter close=%.2f <= level+buf=%.2f", close1, level+levelBuf), "REJ");
+         return false;
+      }
+      
+      if(RejRequireCurrentBarNearLvl)
+      {
+         bool nearNow = levels.IsNear(close1, levelIdx) || 
+                       levels.CandleTouches(1, levelIdx, touchBuf);
+         if(!nearNow)
+         {
+            LogEx(LOG_DEBUG, StringFormat("REJ BUY SKIP: barra corrente non vicina al livello close=%.2f level=%.2f nearDist=%.2f", close1, level, levels.NearDistance(levelIdx)), "REJ");
+            return false;
+         }
+      }
+      
+      sig.valid = true;
+      sig.dir = DIR_BUY;
+      sig.setup = SETUP_REJECTION;
+      sig.anchorIdx = levelIdx;
+      sig.reason = "Rejection BUY, attempts: " + IntegerToString(attempts);
+      return true;
+   }
+   else if(buyCross && belowCount < RejMinRSITrendBars)
+      LogEx(LOG_DEBUG, StringFormat("REJ BUY SKIP: belowCount=%d < minRSITrendBars=%d", belowCount, RejMinRSITrendBars), "REJ");
+   
+   return false;
+}
+
+bool IsPivotHigh(const MqlRates &rates[], int i, int left, int right)
+{
+   if(i - right < 0 || i + left >= (int)ArraySize(rates)) return false;
+   
+   double center = rates[i].high;
+   for(int k = 1; k <= left; k++)
+      if(rates[i + k].high >= center) return false;
+   
+   for(int k = 1; k <= right; k++)
+      if(rates[i - k].high > center) return false;
+   
+   return true;
+}
+
+bool IsPivotLow(const MqlRates &rates[], int i, int left, int right)
+{
+   if(i - right < 0 || i + left >= (int)ArraySize(rates)) return false;
+   
+   double center = rates[i].low;
+   for(int k = 1; k <= left; k++)
+      if(rates[i + k].low <= center) return false;
+   
+   for(int k = 1; k <= right; k++)
+      if(rates[i - k].low < center) return false;
+   
+   return true;
+}
+
+bool FindLatestRegularDivergence(const CLevelManager &levels, const MqlRates &rates[], 
+                                  const double &rsi[], DivergenceSignal &div)
+{
+   div = DivergenceSignal();
+   
+   int total = (int)ArraySize(rates);
+   if(total < 50) return false;
+   
+   int maxScan = MathMin(PivotScanBars, total - (PivotLeftBars + PivotRightBars + 2));
+   
+   for(int recent = PivotRightBars + 1; recent < maxScan; recent++)
+   {
+      if(!IsPivotHigh(rates, recent, PivotLeftBars, PivotRightBars)) continue;
+      
+      for(int older = recent + MinSwingDistanceBars; 
+          older <= MathMin(recent + MaxSwingDistanceBars, maxScan); older++)
+      {
+         if(!IsPivotHigh(rates, older, PivotLeftBars, PivotRightBars)) continue;
+         
+         double pr = rates[recent].high, po = rates[older].high;
+         double rr = rsi[recent], ro = rsi[older];
+         
+         if(pr <= po + MinPriceSwingDiff) continue;
+         if(rr >= ro - MinRSISwingDiff) continue;
+         if(recent > DivRecentValidityBars) continue;
+         
+         int lvl = levels.FindNearestToPrice(pr);
+         if(lvl < 0 || !levels.IsNear(pr, lvl)) continue;
+         
+         div.found = true;
+         div.dir = DIR_SELL;
+         div.pivotOlder = older;
+         div.pivotRecent = recent;
+         div.priceOlder = po;
+         div.priceRecent = pr;
+         div.rsiOlder = ro;
+         div.rsiRecent = rr;
+         div.levelIdx = lvl;
+         return true;
+      }
+   }
+   
+   for(int recent = PivotRightBars + 1; recent < maxScan; recent++)
+   {
+      if(!IsPivotLow(rates, recent, PivotLeftBars, PivotRightBars)) continue;
+      
+      for(int older = recent + MinSwingDistanceBars;
+          older <= MathMin(recent + MaxSwingDistanceBars, maxScan); older++)
+      {
+         if(!IsPivotLow(rates, older, PivotLeftBars, PivotRightBars)) continue;
+         
+         double pr = rates[recent].low, po = rates[older].low;
+         double rr = rsi[recent], ro = rsi[older];
+         
+         if(pr >= po - MinPriceSwingDiff) continue;
+         if(rr <= ro + MinRSISwingDiff) continue;
+         if(recent > DivRecentValidityBars) continue;
+         
+         int lvl = levels.FindNearestToPrice(pr);
+         if(lvl < 0 || !levels.IsNear(pr, lvl)) continue;
+         
+         div.found = true;
+         div.dir = DIR_BUY;
+         div.pivotOlder = older;
+         div.pivotRecent = recent;
+         div.priceOlder = po;
+         div.priceRecent = pr;
+         div.rsiOlder = ro;
+         div.rsiRecent = rr;
+         div.levelIdx = lvl;
+         return true;
+      }
+   }
+   
+   return false;
+}
+
+bool CheckDivergenceSignal(const CLevelManager &levels, CDataCache &cache, 
+                           MqlRates &rates[], SignalResult &sig)
+{
+   sig = SignalResult();
+   if(!UseSetup_DivergenceReversal) return false;
+   
+   int needBars = MathMax(300, PivotScanBars + 50);
+   
+   if((int)ArraySize(rates) < needBars)
+      if(!g_cache.GetRates(needBars, rates))
+         return false;
+   
+   double rsi[], rsiMa[];
+   if(!cache.GetRSIData(needBars, rsi, rsiMa)) return false;
+   
+   DivergenceSignal div;
+   if(!FindLatestRegularDivergence(levels, rates, rsi, div))
+   {
+      LogEx(LOG_DEBUG, StringFormat("DIV SKIP: nessuna divergenza trovata in %d barre", (int)ArraySize(rates)), "DIV");
+      return false;
+   }
+   
+   double close1 = rates[1].close;
+   double levelBuf = LevelBufferPoints * g_point;
+   int levelIdx = div.levelIdx;
+   
+   if(div.dir == DIR_SELL && AllowSell)
+   {
+      if(close1 < levels.Get(levelIdx) - levelBuf)
+      {
+         sig.valid = true;
+         sig.dir = DIR_SELL;
+         sig.setup = SETUP_DIVERGENCE;
+         sig.anchorIdx = levelIdx;
+         sig.reason = "Bearish divergence";
+         return true;
+      }
+   }
+   
+   if(div.dir == DIR_BUY && AllowBuy)
+   {
+      if(close1 > levels.Get(levelIdx) + levelBuf)
+      {
+         sig.valid = true;
+         sig.dir = DIR_BUY;
+         sig.setup = SETUP_DIVERGENCE;
+         sig.anchorIdx = levelIdx;
+         sig.reason = "Bullish divergence";
+         return true;
+      }
+   }
+   
+   return false;
+}
+
+// ============================== FILTERS ============================
+bool CheckSpreadFilter()
+{
+   if(MaxSpreadPoints <= 0) return true;
+   
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0 || bid <= 0) return false;
+   
+   return ((ask - bid) / g_point <= MaxSpreadPoints);
+}
+
+bool CheckATRFilter(CDataCache &cache)
+{
+   if(!UseATRFilter) return true;
+   
+   // SEMPRE ricarica ATR fresco — non usare mai GetLatestATR() qui.
+   // GetLatestATR() legge m_atr[] che può essere stato sovrascritto da
+   // ManagePositions (trailing ATR) con un valore di un TF/barra diverso.
+   double atrBuf[];
+   int minBars = MathMax(ATR_Period * 3, 50);
+   if(!cache.GetATR(minBars, atrBuf)) return false;
+   double atr = cache.GetLatestATR();
+   if(atr <= 0) return false;
+   
+   if(ATRMin > 0 && atr < ATRMin)
+   {
+      LogEx(LOG_DEBUG, StringFormat("ATR SKIP: atr=%.4f < ATRMin=%.4f", atr, ATRMin), "ATR");
+      return false;
+   }
+   if(ATRMax > 0 && atr > ATRMax)
+   {
+      LogEx(LOG_DEBUG, StringFormat("ATR SKIP: atr=%.4f > ATRMax=%.4f", atr, ATRMax), "ATR");
+      return false;
+   }
+   
+   LogEx(LOG_DEBUG, StringFormat("ATR OK: atr=%.4f in [%.4f, %.4f] | ATR_Period=%d ATR_TF=%d", atr, ATRMin, ATRMax, ATR_Period, ATR_TF), "ATR");
+   return true;
+}
+
+// ============================== EVENT HANDLERS =====================
+
+// Chiude tutte le posizioni dell'EA e blocca i nuovi segnali fino al prossimo reset
+void CloseAllEAPositions(const string reason)
+{
+   CTrade t;
+   t.SetExpertMagicNumber(InpMagicNumber);
+   t.SetDeviationInPoints(SlippagePoints);
+   t.SetTypeFillingBySymbol(_Symbol);
+   
+   int closed = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+      
+      // Cancella le linee grafiche della trade prima di chiuderla
+      string base = "ELS_TRADE_" + IntegerToString(ticket) + "_";
+      for(int _i = ObjectsTotal(0) - 1; _i >= 0; _i--)
+      {
+         string nm = ObjectName(0, _i);
+         if(StringFind(nm, base) == 0) ObjectDelete(0, nm);
+      }
+      if(t.PositionClose(ticket))
+      {
+         closed++;
+         if(EnableTradeDrawing)
+         {
+            string prefix = "ELS_TRADE_" + IntegerToString(ticket) + "_";
+            for(int j = ObjectsTotal(0) - 1; j >= 0; j--)
+            {
+               string nm = ObjectName(0, j);
+               if(StringFind(nm, prefix) == 0)
+                  ObjectDelete(0, nm);
+            }
+         }
+      }
+      else
+         LogEx(LOG_ERROR, StringFormat("Failed to close #%I64u: retcode=%d", ticket, t.ResultRetcode()), "EQUITY_TP");
+   }
+   
+   LogEx(LOG_INFO, StringFormat("%s — closed %d positions", reason, closed), "EQUITY_TP");
+}
+
+bool CheckEquityTP()
+{
+   if(!UseEquityTP || EquityTPPercent <= 0.0) return false;
+   if(PositionsTotal() <= 0) return false;
+   
+   // Conta solo le posizioni di questo EA
+   int eaPositions = 0;
+   double floatingProfit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || !PositionSelectByTicket(t)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+      eaPositions++;
+      floatingProfit += PositionGetDouble(POSITION_PROFIT);
+   }
+   if(eaPositions == 0) return false;
+   
+   // Baseline: primo tick con posizioni aperte, o dopo un reset
+   if(g_equityTPBaseline <= 0.0)
+      g_equityTPBaseline = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   double profitPct = (floatingProfit / g_equityTPBaseline) * 100.0;
+   
+   if(profitPct >= EquityTPPercent)
+   {
+      LogEx(LOG_INFO, StringFormat(
+         "Equity TP triggered: profit=%.2f (%.2f%% of baseline %.2f)",
+         floatingProfit, profitPct, g_equityTPBaseline), "EQUITY_TP");
+      
+      CloseAllEAPositions(StringFormat("Equity TP %.1f%%", EquityTPPercent));
+      
+      // Resetta la baseline per il prossimo ciclo
+      g_equityTPBaseline = 0.0;
+      return true;
+   }
+   return false;
+}
+
+
+
+// ============================== HEDGE PROTECTION ==============================
+
+// Piazza un ordine BUY STOP (per coprire SELL) o SELL STOP (per coprire BUY)
+// al livello SL_LEVEL con SL a HedgeSLPoints nella direzione opposta
+// Ritorna il ticket dell'ordine pending (0 = fallito)
+ulong PlaceHedgeOrder(ENUM_DIR mainDir, double triggerLevel, double lots)
+{
+   LogEx(LOG_INFO, StringFormat("PlaceHedgeOrder CALLED: dir=%s trigger=%.2f lots=%.2f enabled=%s",
+      mainDir==DIR_SELL?"SELL":"BUY", triggerLevel, lots, UseHedgeProtection?"YES":"NO"), "HEDGE");
+   if(!UseHedgeProtection) return 0;
+   if(triggerLevel <= 0 || lots <= 0) return 0;
+   
+   double hedgeSL = HedgeSLPoints * g_point;
+   double minDist = MathMax(g_stopsLevelPoints, g_freezeLevelPoints) * g_point;
+   
+   CTrade trade;
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+   
+   bool ok = false;
+   if(mainDir == DIR_SELL)
+   {
+      // Copre SELL → piazza BUY STOP sopra
+      double sl = NormalizeDouble(triggerLevel - hedgeSL, g_digits);
+      double tp = 0; // nessun TP automatico, gestito da ManageHedge
+      if(sl >= triggerLevel - minDist) sl = triggerLevel - minDist - g_point;
+      ok = trade.BuyStop(lots, NormalizeDouble(triggerLevel, g_digits), _Symbol, sl, tp,
+                         ORDER_TIME_GTC, 0, "ELS_HEDGE_BS");
+   }
+   else
+   {
+      // Copre BUY → piazza SELL STOP sotto
+      double sl = NormalizeDouble(triggerLevel + hedgeSL, g_digits);
+      double tp = 0;
+      if(sl <= triggerLevel + minDist) sl = triggerLevel + minDist + g_point;
+      ok = trade.SellStop(lots, NormalizeDouble(triggerLevel, g_digits), _Symbol, sl, tp,
+                          ORDER_TIME_GTC, 0, "ELS_HEDGE_SS");
+   }
+   
+   if(!ok)
+   {
+      LogEx(LOG_INFO, StringFormat(
+         "PlaceHedgeOrder FAILED: dir=%s trigger=%.2f lots=%.2f retcode=%d err=%d ask=%.2f bid=%.2f freezeLvl=%d stopsLvl=%d",
+         mainDir==DIR_SELL?"SELL":"BUY", triggerLevel, lots,
+         trade.ResultRetcode(), GetLastError(),
+         SymbolInfoDouble(_Symbol, SYMBOL_ASK),
+         SymbolInfoDouble(_Symbol, SYMBOL_BID),
+         (int)g_freezeLevelPoints, (int)g_stopsLevelPoints), "HEDGE");
+      return 0;
+   }
+   
+   ulong ticket = trade.ResultOrder();
+   LogEx(LOG_INFO, StringFormat("PlaceHedgeOrder OK: %s STOP #%I64u trigger=%.2f lots=%.2f SL=%.2f",
+      mainDir==DIR_SELL?"BUY":"SELL", ticket, triggerLevel, lots,
+      triggerLevel - (mainDir==DIR_SELL ? hedgeSL : -hedgeSL)), "HEDGE");
+   return ticket;
+}
+
+// Cancella un ordine pending hedge o chiude la posizione se già triggerata
+void CancelHedgeOrder(ulong &hedgeTicket)
+{
+   if(hedgeTicket == 0) return;
+   
+   CTrade trade;
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   
+   if(OrderSelect(hedgeTicket))
+   {
+      // Ancora pending → cancella
+      if(trade.OrderDelete(hedgeTicket))
+         LogEx(LOG_INFO, StringFormat("CancelHedgeOrder (pending) OK: #%I64u", hedgeTicket), "HEDGE");
+      else
+         LogEx(LOG_WARN, StringFormat("CancelHedgeOrder (pending) FAILED: #%I64u err=%d", hedgeTicket, GetLastError()), "HEDGE");
+   }
+   else if(PositionSelectByTicket(hedgeTicket))
+   {
+      // Già triggerato come posizione → chiudi
+      if(trade.PositionClose(hedgeTicket))
+         LogEx(LOG_INFO, StringFormat("CancelHedgeOrder (posizione) chiusa: #%I64u", hedgeTicket), "HEDGE");
+      else
+         LogEx(LOG_WARN, StringFormat("CancelHedgeOrder (posizione) FAILED: #%I64u err=%d", hedgeTicket, GetLastError()), "HEDGE");
+   }
+   hedgeTicket = 0;
+}
+
+// Gestisce il ciclo completo del hedge per una posizione principale:
+// 1. Se hedgeTicket==0 → ripiazza il pending order (hedge mancante)
+// 2. Se pending → controlla solo che esista ancora
+// 3. Se posizione attiva → sposta SL a BE dopo HedgeMinProfitPoints punti
+// 4. Se posizione chiusa → ripiazza il pending order
+void ManageHedgePosition(ulong &hedgeTicket, ENUM_DIR mainDir, double triggerLevel, double lots)
+{
+   // --- Caso 0: hedgeTicket mancante → ripiazza subito ---
+   if(hedgeTicket == 0)
+   {
+      LogEx(LOG_INFO, StringFormat("Hedge mancante per trigger=%.2f — ripiazzo", triggerLevel), "HEDGE");
+      hedgeTicket = PlaceHedgeOrder(mainDir, triggerLevel, lots);
+      return;
+   }
+   
+   // --- Caso 1: ancora pending order (non triggerato) → niente da fare ---
+   if(OrderSelect(hedgeTicket)) return;
+   
+   // --- Caso 2: posizione aperta ---
+   if(PositionSelectByTicket(hedgeTicket))
+   {
+      double hedgeEntry   = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL    = PositionGetDouble(POSITION_SL);
+      // Per hedge BUY (copre SELL) usiamo ASK; per hedge SELL (copre BUY) usiamo BID
+      double currentPrice = (mainDir == DIR_SELL)
+                            ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                            : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      double moveThreshold = HedgeMinProfitPoints * g_point;
+      if(moveThreshold <= 0) return;
+      
+      bool shouldBE = false;
+      double bePrice = NormalizeDouble(hedgeEntry, g_digits);
+      
+      if(mainDir == DIR_SELL) // hedge è BUY → in profitto quando prezzo sale
+         shouldBE = (currentPrice >= hedgeEntry + moveThreshold);
+      else                    // hedge è SELL → in profitto quando prezzo scende
+         shouldBE = (currentPrice <= hedgeEntry - moveThreshold);
+      
+      // SL già a BE o migliore → skip
+      bool alreadyBE = (mainDir == DIR_SELL)
+                       ? (currentSL >= bePrice - g_point)
+                       : (currentSL <= bePrice + g_point && currentSL > 0);
+      
+      if(shouldBE && !alreadyBE)
+      {
+         double minDist = MathMax(g_stopsLevelPoints, g_freezeLevelPoints) * g_point;
+         bool slValid = (mainDir == DIR_SELL)
+                        ? (bePrice < currentPrice - minDist)
+                        : (bePrice > currentPrice + minDist);
+         if(slValid)
+         {
+            CTrade trade;
+            trade.SetExpertMagicNumber(InpMagicNumber);
+            if(trade.PositionModify(hedgeTicket, bePrice, 0))
+               LogEx(LOG_INFO, StringFormat(
+                  "Hedge #%I64u SL→BE %.2f (price=%.2f entry=%.2f threshold=%.1f pts)",
+                  hedgeTicket, bePrice, currentPrice, hedgeEntry, moveThreshold/g_point), "HEDGE");
+            else
+               LogEx(LOG_WARN, StringFormat(
+                  "Hedge #%I64u SL→BE FAILED: bePrice=%.2f price=%.2f minDist=%.2f err=%d",
+                  hedgeTicket, bePrice, currentPrice, minDist, GetLastError()), "HEDGE");
+         }
+      }
+      return;
+   }
+   
+   // --- Caso 3: né pending né posizione → è stato chiuso (SL o BE) → ripiazza ---
+   ulong oldTicket = hedgeTicket;
+   hedgeTicket = 0;
+   ulong newTicket = PlaceHedgeOrder(mainDir, triggerLevel, lots);
+   hedgeTicket = newTicket;
+   LogEx(LOG_INFO, StringFormat("Hedge #%I64u chiuso (SL/BE) — ripiazzato #%I64u a %.2f (ok=%s)",
+      oldTicket, newTicket, triggerLevel, newTicket>0?"SI":"NO"), "HEDGE");
+}
+
+// ============================== RSI VISUAL FUNCTIONS ==============================
+
+void RSIWindow_DeleteObjects()
+{
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string nm = ObjectName(0, i);
+      if(StringFind(nm, g_rsiObjPrefix) == 0)
+         ObjectDelete(0, nm);
+   }
+}
+
+bool RSIWindow_FindSubWindow()
+{
+   for(int w = 1; w < ChartGetInteger(0, CHART_WINDOWS_TOTAL); w++)
+   {
+      for(int k = 0; k < ChartIndicatorsTotal(0, w); k++)
+      {
+         string nm = ChartIndicatorName(0, w, k);
+         if(StringFind(nm, "RSI") >= 0 && StringFind(nm, IntegerToString(RSI_Period)) >= 0)
+         {
+            g_rsiSubWindow = w;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+void RSIWindow_Init()
+{
+   if(!EnableRSIWindow) return;
+   // Crea handle RSI sul TF del segnale e aggiungilo al chart (crea sottofinestra)
+   if(g_rsiVisualHandle == INVALID_HANDLE)
+      g_rsiVisualHandle = iRSI(_Symbol, InpSignalTF, RSI_Period, PRICE_CLOSE);
+   if(g_rsiVisualHandle == INVALID_HANDLE) return;
+   // Aggiunge alla sottofinestra 1 (MT5 la crea se non esiste)
+   if(!RSIWindow_FindSubWindow())
+   {
+      ChartIndicatorAdd(0, (int)ChartGetInteger(0, CHART_WINDOWS_TOTAL), g_rsiVisualHandle);
+      Sleep(200);
+      RSIWindow_FindSubWindow();
+   }
+}
+
+void RSIWindow_Release()
+{
+   RSIWindow_DeleteObjects();
+   if(g_rsiVisualHandle != INVALID_HANDLE)
+   {
+      if(g_rsiSubWindow >= 0)
+         ChartIndicatorDelete(0, g_rsiSubWindow, ChartIndicatorName(0, g_rsiSubWindow, 0));
+      IndicatorRelease(g_rsiVisualHandle);
+      g_rsiVisualHandle = INVALID_HANDLE;
+   }
+   g_rsiSubWindow = -1;
+}
+
+void RSIWindow_DrawCrossMarkers(const double &rsi[], const double &rsiMa[], int total)
+{
+   if(g_rsiSubWindow < 0) return;
+   int limit = MathMin(total - 2, PivotScanBars * 3);
+   int count = 0;
+   for(int i = 1; i < limit; i++)
+   {
+      if(rsi[i] <= 0 || rsiMa[i] <= 0) continue;
+      if(rsi[i+1] <= 0 || rsiMa[i+1] <= 0) continue;
+      bool crossUp   = (rsi[i+1] < rsiMa[i+1] && rsi[i] >= rsiMa[i]);
+      bool crossDown = (rsi[i+1] > rsiMa[i+1] && rsi[i] <= rsiMa[i]);
+      if(!crossUp && !crossDown) continue;
+      datetime t = iTime(_Symbol, InpSignalTF, i);
+      if(t == 0) continue;
+      
+      string nm  = g_rsiObjPrefix + "CRS_" + IntegerToString((int)t);
+      string lbl = g_rsiObjPrefix + "LBL_" + IntegerToString((int)t);
+      color  clr = crossUp ? clrLime : clrRed;
+      string txt = crossUp ? "Bull" : "Bear";
+      int arrow  = crossUp ? 233 : 234;
+      double yA  = crossUp ? rsi[i] - 5.0 : rsi[i] + 5.0;
+      double yL  = crossUp ? rsi[i] - 10.0 : rsi[i] + 10.0;
+      
+      if(!ObjectCreate(0, nm, OBJ_ARROW, g_rsiSubWindow, t, yA)) continue;
+      ObjectSetInteger(0, nm, OBJPROP_ARROWCODE, arrow);
+      ObjectSetInteger(0, nm, OBJPROP_COLOR, clr);
+      ObjectSetInteger(0, nm, OBJPROP_WIDTH, 2);
+      ObjectSetString(0,  nm, OBJPROP_TOOLTIP, txt);
+      
+      ObjectCreate(0, lbl, OBJ_TEXT, g_rsiSubWindow, t, yL);
+      ObjectSetString(0,  lbl, OBJPROP_TEXT, txt);
+      ObjectSetInteger(0, lbl, OBJPROP_COLOR, clr);
+      ObjectSetInteger(0, lbl, OBJPROP_FONTSIZE, 7);
+      ObjectSetInteger(0, lbl, OBJPROP_ANCHOR, crossUp ? ANCHOR_TOP : ANCHOR_BOTTOM);
+      count++;
+   }
+}
+
+void RSIWindow_DrawDivergences(const double &rsi[], const MqlRates &rates[], int total)
+{
+   if(g_rsiSubWindow < 0) return;
+   int maxScan = MathMin(PivotScanBars, total - (PivotLeftBars + PivotRightBars + 2));
+   int dc = 0;
+
+   // Bearish: prezzo HH, RSI LH
+   for(int recent = PivotRightBars + 1; recent < maxScan; recent++)
+   {
+      if(!IsPivotHigh(rates, recent, PivotLeftBars, PivotRightBars)) continue;
+      if(recent > DivRecentValidityBars) continue;
+      if(rsi[recent] <= 0) continue;
+      for(int older = recent + MinSwingDistanceBars;
+          older <= MathMin(recent + MaxSwingDistanceBars, maxScan); older++)
+      {
+         if(!IsPivotHigh(rates, older, PivotLeftBars, PivotRightBars)) continue;
+         if(rsi[older] <= 0) continue;
+         double pr = rates[recent].high, po = rates[older].high;
+         double rr = rsi[recent],        ro = rsi[older];
+         if(pr <= po + MinPriceSwingDiff) continue;
+         if(rr >= ro - MinRSISwingDiff)  continue;
+         datetime t1 = iTime(_Symbol, InpSignalTF, older);
+         datetime t2 = iTime(_Symbol, InpSignalTF, recent);
+         if(t1 == 0 || t2 == 0) break;
+         string nm = g_rsiObjPrefix + "DVB_" + IntegerToString(dc++);
+         ObjectCreate(0, nm, OBJ_TREND, g_rsiSubWindow, t1, ro, t2, rr);
+         ObjectSetInteger(0, nm, OBJPROP_COLOR, clrRed);
+         ObjectSetInteger(0, nm, OBJPROP_WIDTH, 2);
+         ObjectSetInteger(0, nm, OBJPROP_RAY_RIGHT, false);
+         ObjectSetInteger(0, nm, OBJPROP_RAY_LEFT,  false);
+         ObjectSetString(0,  nm, OBJPROP_TOOLTIP, StringFormat("Bear Div RSI %.1f→%.1f", ro, rr));
+         break;
+      }
+   }
+
+   // Bullish: prezzo LL, RSI HL
+   for(int recent = PivotRightBars + 1; recent < maxScan; recent++)
+   {
+      if(!IsPivotLow(rates, recent, PivotLeftBars, PivotRightBars)) continue;
+      if(recent > DivRecentValidityBars) continue;
+      if(rsi[recent] <= 0) continue;
+      for(int older = recent + MinSwingDistanceBars;
+          older <= MathMin(recent + MaxSwingDistanceBars, maxScan); older++)
+      {
+         if(!IsPivotLow(rates, older, PivotLeftBars, PivotRightBars)) continue;
+         if(rsi[older] <= 0) continue;
+         double pr = rates[recent].low, po = rates[older].low;
+         double rr = rsi[recent],       ro = rsi[older];
+         if(pr >= po - MinPriceSwingDiff) continue;
+         if(rr <= ro + MinRSISwingDiff)  continue;
+         datetime t1 = iTime(_Symbol, InpSignalTF, older);
+         datetime t2 = iTime(_Symbol, InpSignalTF, recent);
+         if(t1 == 0 || t2 == 0) break;
+         string nm = g_rsiObjPrefix + "DVL_" + IntegerToString(dc++);
+         ObjectCreate(0, nm, OBJ_TREND, g_rsiSubWindow, t1, ro, t2, rr);
+         ObjectSetInteger(0, nm, OBJPROP_COLOR, clrLime);
+         ObjectSetInteger(0, nm, OBJPROP_WIDTH, 2);
+         ObjectSetInteger(0, nm, OBJPROP_RAY_RIGHT, false);
+         ObjectSetInteger(0, nm, OBJPROP_RAY_LEFT,  false);
+         ObjectSetString(0,  nm, OBJPROP_TOOLTIP, StringFormat("Bull Div RSI %.1f→%.1f", ro, rr));
+         break;
+      }
+   }
+}
+
+void RSIWindow_DrawRSIMA()
+{
+   // Disegna la SMA dell'RSI come serie di segmenti OBJ_TREND nella sottofinestra
+   // (l'handle RSI viene già disegnato automaticamente da ChartIndicatorAdd)
+   if(g_rsiSubWindow < 0) return;
+   int total = MathMin(PivotScanBars * 3, 500);
+   double rsi[], rsiMa[];
+   if(!g_cache.GetRSIData(total, rsi, rsiMa)) return;
+
+   // Disegna segmenti MA come linea continua
+   int prev = -1;
+   datetime tPrev = 0;
+   double maPrev = 0;
+   for(int i = total - 1; i >= 1; i--)
+   {
+      if(rsiMa[i] <= 0 || rsiMa[i] >= EMPTY_VALUE - 1) continue;
+      datetime t = iTime(_Symbol, InpSignalTF, i);
+      if(t == 0) continue;
+      if(tPrev != 0)
+      {
+         string nm = g_rsiObjPrefix + "MA_" + IntegerToString((int)t);
+         ObjectCreate(0, nm, OBJ_TREND, g_rsiSubWindow, tPrev, maPrev, t, rsiMa[i]);
+         ObjectSetInteger(0, nm, OBJPROP_COLOR, clrGold);
+         ObjectSetInteger(0, nm, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nm, OBJPROP_RAY_RIGHT, false);
+         ObjectSetInteger(0, nm, OBJPROP_RAY_LEFT,  false);
+         ObjectSetInteger(0, nm, OBJPROP_STYLE, STYLE_SOLID);
+         ObjectSetString(0,  nm, OBJPROP_TOOLTIP, StringFormat("RSI MA %.2f", rsiMa[i]));
+      }
+      tPrev = t;
+      maPrev = rsiMa[i];
+   }
+}
+
+void RSIWindow_Update()
+{
+   if(!EnableRSIWindow) return;
+   datetime curBar = iTime(_Symbol, InpSignalTF, 0);
+   if(curBar == g_rsiLastDraw) return;
+   g_rsiLastDraw = curBar;
+
+   if(g_rsiSubWindow < 0) RSIWindow_FindSubWindow();
+   if(g_rsiSubWindow < 0) { RSIWindow_Init(); return; }
+
+   RSIWindow_DeleteObjects();
+
+   int total = MathMin(PivotScanBars * 3 + 50, 600);
+   double rsi[], rsiMa[];
+   if(!g_cache.GetRSIData(total, rsi, rsiMa)) return;
+
+   MqlRates rates[];
+   if(!g_cache.GetRates(total, rates)) return;
+
+   RSIWindow_DrawRSIMA();
+   RSIWindow_DrawCrossMarkers(rsi, rsiMa, (int)ArraySize(rsi));
+   RSIWindow_DrawDivergences(rsi, rates, (int)ArraySize(rates));
+   ChartRedraw(0);
+}
+
+int OnInit()
+{
+   g_digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   g_point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   g_stopsLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   g_freezeLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   
+   if(HedgingOnly)
+   {
+      long mm = AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+      g_isHedging = (mm == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+      if(!g_isHedging)
+      {
+         LogEx(LOG_ERROR, "Account must be HEDGING mode", "INIT");
+         return INIT_FAILED;
+      }
+   }
+   
+   if(!g_cache.Init())
+   {
+      LogEx(LOG_ERROR, "Failed to initialize data cache", "INIT");
+      return INIT_FAILED;
+   }
+   
+   if(!g_tradeMgr.Init())
+   {
+      LogEx(LOG_ERROR, "Failed to initialize trade manager", "INIT");
+      g_cache.Release();
+      return INIT_FAILED;
+   }
+   
+   string ymd = TimeToString(TimeCurrent(), TIME_DATE);
+   StringReplace(ymd, ".", "-");
+   
+   if(g_levels.LoadForDate(ymd))
+   {
+      g_levels.Draw();
+      g_tradingEnabled = true;
+      LogEx(LOG_INFO, "Loaded " + IntegerToString(g_levels.Count()) + " levels for " + ymd, "INIT");
+   }
+   else
+   {
+      g_tradingEnabled = false;
+      LogEx(LOG_WARN, "No levels for " + ymd + ", trading disabled until levels available", "INIT");
+   }
+   
+   g_stats.startTime = TimeCurrent();
+   EventSetTimer(InpTimerSeconds);
+   
+   RSIWindow_Init();
+   
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   RSIWindow_Release();
+   g_cache.Release();
+   g_levels.DeleteObjects();
+   
+   if(g_stats.tradesOpened > 0)
+      g_stats.PrintReport();
+   
+   LogEx(LOG_INFO, "Deinitialized", "DEINIT");
+}
+
+void OnTimer()
+{
+   string ymd = TimeToString(TimeCurrent(), TIME_DATE);
+   StringReplace(ymd, ".", "-");
+   
+   if(ymd == g_levels.LoadedDate()) return;
+   
+   // Nuovo giorno: cancella tutti gli oggetti grafici del giorno precedente
+   // (linee dei livelli ELS_LVL_ e linee delle trade ELS_TRADE_)
+   g_levels.DeleteObjects();
+   
+   if(!g_levels.LoadForDate(ymd))
+   {
+      if(TimeCurrent() - g_lastNoLevelsLog > 300)
+      {
+         LogEx(LOG_WARN, "No levels for " + ymd + ", trading disabled", "TIMER");
+         g_lastNoLevelsLog = TimeCurrent();
+         g_noLevelsCount++;
+      }
+      g_tradingEnabled = false;
+      return;
+   }
+   
+   g_levels.Draw();
+   g_tradingEnabled = true;
+   g_lastNoLevelsLog = 0;
+   g_noLevelsCount = 0;
+   
+   LogEx(LOG_INFO, "Loaded " + IntegerToString(g_levels.Count()) + " levels for " + ymd, "TIMER");
+}
+
+void OnTick()
+{
+   if(!g_tradingEnabled || g_levels.Count() < 2)
+   {
+      if(PositionsTotal() > 0)
+         g_tradeMgr.ManagePositions(g_levels, g_cache, g_stats);
+      return;
+   }
+   
+   g_stats.UpdateEquity();
+   
+   // Equity TP: se il profitto flottante supera la soglia, chiudi tutto e ricomincia
+   if(CheckEquityTP()) return;
+   
+   g_tradeMgr.ManagePositions(g_levels, g_cache, g_stats);
+   
+   // HEDGE safety net: ogni tick verifica ogni posizione aperta senza hedge valido
+   // Copre sia hedgeTicket==0 che ticket orfani (plasmaReset da ManageHedgePosition)
+   if(UseHedgeProtection)
+   {
+      for(int _si = 0; _si < (int)ArraySize(g_tradeMgr.m_states); _si++)
+      {
+         ulong mainTkt = g_tradeMgr.m_states[_si].ticket;
+         
+         // Posizione principale deve essere ancora aperta
+         if(!PositionSelectByTicket(mainTkt)) continue;
+         
+         // T1 già colpito → hedge non serve più
+         if(g_tradeMgr.IsTarget1Hit(mainTkt)) continue;
+         
+         // Leggi proprietà SUBITO dopo PositionSelectByTicket
+         ENUM_DIR mainDir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? DIR_BUY : DIR_SELL;
+         double mainEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+         double mainVol   = PositionGetDouble(POSITION_VOLUME);
+         
+         ulong hTkt = g_tradeMgr.m_states[_si].hedgeTicket;
+         
+         // Controlla se hedge esiste (senza cambiare la selezione attiva della main)
+         bool hedgeExists = false;
+         if(hTkt != 0)
+         {
+            if(OrderSelect(hTkt))       hedgeExists = true;
+            else if(PositionSelectByTicket(hTkt)) hedgeExists = true;
+            // Ri-seleziona main dopo i check
+            PositionSelectByTicket(mainTkt);
+         }
+         
+         LogEx(LOG_INFO, StringFormat(
+            "HEDGE safety-net check: main=#%I64u hTkt=%I64u exists=%s dir=%s entry=%.2f",
+            mainTkt, hTkt, hedgeExists?"Y":"N",
+            mainDir==DIR_SELL?"SELL":"BUY", mainEntry), "HEDGE");
+         
+         if(hedgeExists) continue; // hedge ok, niente da fare
+         
+         // Hedge mancante o orfano → ripiazza
+         double lBuf     = LevelBufferPoints * g_point;
+         double hTrigger = 0.0;
+         
+         if(mainDir == DIR_SELL)
+         {
+            for(int _lk = 0; _lk < g_levels.Count(); _lk++)
+               if(g_levels.Get(_lk) > mainEntry + lBuf) { hTrigger = g_levels.Get(_lk); break; }
+         }
+         else
+         {
+            for(int _lk = g_levels.Count()-1; _lk >= 0; _lk--)
+               if(g_levels.Get(_lk) < mainEntry - lBuf) { hTrigger = g_levels.Get(_lk); break; }
+         }
+         
+         if(hTrigger > 0)
+         {
+            ulong newH = PlaceHedgeOrder(mainDir, hTrigger, mainVol);
+            g_tradeMgr.m_states[_si].hedgeTicket = newH;
+            LogEx(LOG_INFO, StringFormat(
+               "HEDGE safety-net RIPIAZZO: old=#%I64u → nuovo #%I64u @ %.2f main=#%I64u ok=%s",
+               hTkt, newH, hTrigger, mainTkt, newH>0?"SI":"NO"), "HEDGE");
+         }
+         else
+         {
+            LogEx(LOG_WARN, StringFormat(
+               "HEDGE safety-net: main=#%I64u nessun trigger level trovato entry=%.2f dir=%s",
+               mainTkt, mainEntry, mainDir==DIR_SELL?"SELL":"BUY"), "HEDGE");
+         }
+      }
+   }
+   
+   RSIWindow_Update();
+   
+   datetime curBar = iTime(_Symbol, InpSignalTF, 0);
+   if(curBar == 0 || curBar == g_lastBarTime) return;
+   g_lastBarTime = curBar;
+   
+   if(!CheckSpreadFilter()) return;
+   if(!CheckATRFilter(g_cache)) return;
+   
+   int needBars = MathMax(300, PivotScanBars + 50);
+   
+   MqlRates rates[];
+   if(!g_cache.GetRates(needBars, rates)) return;
+   
+   double rsi[], rsiMa[], atr[];
+   if(!g_cache.GetRSIData(needBars, rsi, rsiMa)) return;
+   if(!g_cache.GetATR(needBars, atr)) return;
+   
+   string openDate = TimeToString(TimeCurrent(), TIME_DATE);
+   StringReplace(openDate, ".", "-");
+   
+   if(UseSetup_DivergenceReversal)
+   {
+      SignalResult sig;
+      if(CheckDivergenceSignal(g_levels, g_cache, rates, sig))
+      {
+         g_stats.totalSignals++;
+         if(g_tradeMgr.Open(sig, g_levels, g_cache.GetLatestATR(), openDate))
+            return;
+      }
+   }
+   
+   if(UseSetup_RejectionMomentum)
+   {
+      SignalResult sig;
+      if(CheckRejectionSignal(g_levels, g_cache, sig))
+      {
+         g_stats.totalSignals++;
+         g_tradeMgr.Open(sig, g_levels, g_cache.GetLatestATR(), openDate);
+      }
+   }
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   
+   ulong deal = trans.deal;
+   if(deal == 0) return;
+   
+   // HistoryDealSelect DEVE essere chiamata prima di qualsiasi HistoryDealGet*
+   if(!HistoryDealSelect(deal)) return;
+   
+   if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) return;
+   if((long)HistoryDealGetInteger(deal, DEAL_MAGIC) != (long)InpMagicNumber) return;
+   
+   long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT) return;
+   
+   // Cancella le linee grafiche della trade chiusa (SL broker, TP broker, chiusura manuale)
+   if(EnableTradeDrawing)
+   {
+      ulong posId = HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+      if(posId > 0)
+      {
+         string base = "ELS_TRADE_" + IntegerToString(posId) + "_";
+         for(int _i = ObjectsTotal(0) - 1; _i >= 0; _i--)
+         {
+            string nm = ObjectName(0, _i);
+            if(StringFind(nm, base) == 0) ObjectDelete(0, nm);
+         }
+         ChartRedraw(0);
+      }
+   }
+   
+   double profit = HistoryDealGetDouble(deal, DEAL_PROFIT);
+   if(profit > 0)
+      g_stats.grossProfit += profit;
+   else
+      g_stats.grossLoss += MathAbs(profit);
+   
+   g_stats.tradesClosed++;
+   
+   // HEDGE: scansiona tutti gli stati e controlla se qualche hedgeTicket
+   // non esiste più (né come pending né come posizione) → ripiazza
+   if(UseHedgeProtection)
+   {
+      for(int _si = 0; _si < (int)ArraySize(g_tradeMgr.m_states); _si++)
+      {
+         ulong hTkt = g_tradeMgr.m_states[_si].hedgeTicket;
+         if(hTkt == 0) continue;
+         
+         // Se esiste ancora come pending o posizione → skip
+         if(OrderSelect(hTkt) || PositionSelectByTicket(hTkt)) continue;
+         
+         // Non esiste più → è stato chiuso. La posizione principale è ancora aperta?
+         ulong mainTkt = g_tradeMgr.m_states[_si].ticket;
+         if(!PositionSelectByTicket(mainTkt)) continue;
+         if(g_tradeMgr.IsTarget1Hit(mainTkt)) continue;
+         
+         // Leggi proprietà PRIMA di qualsiasi altra selezione
+         ENUM_DIR mainDir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? DIR_BUY : DIR_SELL;
+         double mainEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+         double mainVol   = PositionGetDouble(POSITION_VOLUME);
+         double lBuf      = LevelBufferPoints * g_point;
+         double hTrigger  = 0.0;
+         
+         if(mainDir == DIR_SELL)
+         {
+            for(int _lk = 0; _lk < g_levels.Count(); _lk++)
+               if(g_levels.Get(_lk) > mainEntry + lBuf) { hTrigger = g_levels.Get(_lk); break; }
+         }
+         else
+         {
+            for(int _lk = g_levels.Count()-1; _lk >= 0; _lk--)
+               if(g_levels.Get(_lk) < mainEntry - lBuf) { hTrigger = g_levels.Get(_lk); break; }
+         }
+         
+         if(hTrigger > 0)
+         {
+            g_tradeMgr.m_states[_si].hedgeTicket = 0;
+            ulong newH = PlaceHedgeOrder(mainDir, hTrigger, mainVol);
+            g_tradeMgr.m_states[_si].hedgeTicket = newH;
+            LogEx(LOG_INFO, StringFormat(
+               "HEDGE re-place: #%I64u chiuso → nuovo #%I64u @ %.2f (mainPos=#%I64u ok=%s)",
+               hTkt, newH, hTrigger, mainTkt, newH>0?"SI":"NO"), "HEDGE");
+         }
+         else
+         {
+            LogEx(LOG_WARN, StringFormat(
+               "HEDGE re-place SKIP: #%I64u chiuso ma nessun trigger level trovato entry=%.2f",
+               hTkt, mainEntry), "HEDGE");
+         }
+      }
+   }
+}
