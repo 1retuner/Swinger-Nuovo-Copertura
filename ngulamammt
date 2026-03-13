@@ -1811,10 +1811,100 @@ void CTradeManager::ManagePositions(const CLevelManager &levels, CDataCache &cac
       }
       
       // =====================================================================
+      // HEDGE PROTECTION: eseguito SEMPRE, anche durante grace period
+      // Il hedge deve poter ripiazzare ordini e spostare SL a BE indipendentemente
+      // =====================================================================
+      if(UseHedgeProtection && !IsTarget1Hit(ticket))
+      {
+         int _hsi = FindStateIndex(ticket);
+         if(_hsi >= 0)
+         {
+            double levelBuf = LevelBufferPoints * g_point;
+            double hTrigger = 0.0;
+            if(dir == DIR_SELL)
+            {
+               for(int _lk = 0; _lk < levels.Count(); _lk++)
+                  if(levels.Get(_lk) > entry + levelBuf) { hTrigger = levels.Get(_lk); break; }
+            }
+            else
+            {
+               for(int _lk = levels.Count()-1; _lk >= 0; _lk--)
+                  if(levels.Get(_lk) < entry - levelBuf) { hTrigger = levels.Get(_lk); break; }
+            }
+            if(hTrigger > 0)
+            {
+               ManageHedgePosition(m_states[_hsi].hedgeTicket, dir, hTrigger, vol);
+               
+               // Se prezzo raggiunge livello successivo al trigger → chiudi tutto
+               double nextLevel = 0.0;
+               if(dir == DIR_SELL)
+               {
+                  for(int _nl = 0; _nl < levels.Count(); _nl++)
+                     if(levels.Get(_nl) > hTrigger + levelBuf) { nextLevel = levels.Get(_nl); break; }
+                  if(nextLevel > 0 && current >= nextLevel - levelBuf)
+                  {
+                     LogEx(LOG_INFO, StringFormat("Hedge: prezzo %.2f >= livello successivo %.2f — chiudo tutto", current, nextLevel), "HEDGE");
+                     if(PositionSelectByTicket(m_states[_hsi].hedgeTicket))
+                     { CTrade _ct; _ct.SetExpertMagicNumber(InpMagicNumber); _ct.PositionClose(m_states[_hsi].hedgeTicket); }
+                     else if(OrderSelect(m_states[_hsi].hedgeTicket))
+                        CancelHedgeOrder(m_states[_hsi].hedgeTicket);
+                     m_states[_hsi].hedgeTicket = 0;
+                     CTrade _ct2; _ct2.SetExpertMagicNumber(InpMagicNumber);
+                     _ct2.PositionClose(ticket);
+                     continue;
+                  }
+               }
+               else
+               {
+                  for(int _nl = levels.Count()-1; _nl >= 0; _nl--)
+                     if(levels.Get(_nl) < hTrigger - levelBuf) { nextLevel = levels.Get(_nl); break; }
+                  if(nextLevel > 0 && current <= nextLevel + levelBuf)
+                  {
+                     LogEx(LOG_INFO, StringFormat("Hedge: prezzo %.2f <= livello successivo %.2f — chiudo tutto", current, nextLevel), "HEDGE");
+                     if(PositionSelectByTicket(m_states[_hsi].hedgeTicket))
+                     { CTrade _ct; _ct.SetExpertMagicNumber(InpMagicNumber); _ct.PositionClose(m_states[_hsi].hedgeTicket); }
+                     else if(OrderSelect(m_states[_hsi].hedgeTicket))
+                        CancelHedgeOrder(m_states[_hsi].hedgeTicket);
+                     m_states[_hsi].hedgeTicket = 0;
+                     CTrade _ct2; _ct2.SetExpertMagicNumber(InpMagicNumber);
+                     _ct2.PositionClose(ticket);
+                     continue;
+                  }
+               }
+            }
+         }
+      }
+      
+      // =====================================================================
       // Gestione SL dinamico (trailing a scalini sui livelli)
       // Sospeso durante il grace period per evitare BE immediato
       // =====================================================================
-      if(inGracePeriod) continue;  // Nessun trailing durante la finestra di grazia
+      if(inGracePeriod)
+      {
+         // Durante il grace period salta il trailing SL, ma gestisce il hedge
+         if(UseHedgeProtection && !IsTarget1Hit(ticket))
+         {
+            int _hsi = FindStateIndex(ticket);
+            if(_hsi >= 0)
+            {
+               double levelBuf = LevelBufferPoints * g_point;
+               double hTrigger = 0.0;
+               if(dir == DIR_SELL)
+               {
+                  for(int _lk = 0; _lk < levels.Count(); _lk++)
+                     if(levels.Get(_lk) > entry + levelBuf) { hTrigger = levels.Get(_lk); break; }
+               }
+               else
+               {
+                  for(int _lk = levels.Count()-1; _lk >= 0; _lk--)
+                     if(levels.Get(_lk) < entry - levelBuf) { hTrigger = levels.Get(_lk); break; }
+               }
+               if(hTrigger > 0)
+                  ManageHedgePosition(m_states[_hsi].hedgeTicket, dir, hTrigger, vol);
+            }
+         }
+         continue;
+      }
       
       double newSL = sl;
       // FIX 3: Il TP NON viene riscritto da ManagePositions se già impostato (tp > 0)
@@ -1988,81 +2078,6 @@ void CTradeManager::ManagePositions(const CLevelManager &levels, CDataCache &cac
             ModifySLTP(ticket, newSL, newTP);
       }
       
-      // HEDGE PROTECTION: gestisce il hedge order associato (ripiazza se chiuso per SL, chiude a BE se in profit)
-      if(UseHedgeProtection && !IsTarget1Hit(ticket))
-      {
-         int _hsi = FindStateIndex(ticket);
-         if(_hsi >= 0)
-         {
-            double levelBuf = LevelBufferPoints * g_point; // necessario in questo scope
-            // Recupera il livello hedge (L+1) dalla posizione corrente
-            // Il trigger del hedge è il primo livello dal lato perdente rispetto all'entry
-            double hTrigger = 0.0;
-            if(dir == DIR_SELL)
-            {
-               // hedge trigger = primo livello sopra entry
-               for(int _lk = 0; _lk < levels.Count(); _lk++)
-                  if(levels.Get(_lk) > entry + levelBuf) { hTrigger = levels.Get(_lk); break; }
-            }
-            else
-            {
-               // hedge trigger = primo livello sotto entry
-               for(int _lk = levels.Count()-1; _lk >= 0; _lk--)
-                  if(levels.Get(_lk) < entry - levelBuf) { hTrigger = levels.Get(_lk); break; }
-            }
-            if(hTrigger > 0)
-            {
-               ManageHedgePosition(m_states[_hsi].hedgeTicket, dir, hTrigger, vol);
-               
-               // Se il prezzo ha raggiunto il livello successivo al trigger (oltre il hedge),
-               // chiudi tutte le posizioni originali di questo EA e il hedge stesso.
-               // Questo è il caso "prezzo continua oltre il fake out fino al livello +2"
-               double nextLevel = 0.0;
-               if(dir == DIR_SELL)
-               {
-                  // Cerca livello sopra hTrigger
-                  for(int _nl = 0; _nl < levels.Count(); _nl++)
-                     if(levels.Get(_nl) > hTrigger + levelBuf) { nextLevel = levels.Get(_nl); break; }
-                  if(nextLevel > 0 && current >= nextLevel - levelBuf)
-                  {
-                     LogEx(LOG_INFO, StringFormat("Hedge: prezzo %.2f raggiunge livello successivo %.2f — chiudo tutto", current, nextLevel), "HEDGE");
-                     // Chiudi il hedge come posizione (se triggerato)
-                     if(PositionSelectByTicket(m_states[_hsi].hedgeTicket))
-                     {
-                        CTrade _ct; _ct.SetExpertMagicNumber(InpMagicNumber);
-                        _ct.PositionClose(m_states[_hsi].hedgeTicket);
-                     }
-                     else if(OrderSelect(m_states[_hsi].hedgeTicket))
-                        CancelHedgeOrder(m_states[_hsi].hedgeTicket);
-                     m_states[_hsi].hedgeTicket = 0;
-                     // Chiudi la posizione originale (verrà rimossa dallo stato automaticamente)
-                     CTrade _ct2; _ct2.SetExpertMagicNumber(InpMagicNumber);
-                     _ct2.PositionClose(ticket);
-                  }
-               }
-               else // DIR_BUY
-               {
-                  // Cerca livello sotto hTrigger
-                  for(int _nl = levels.Count()-1; _nl >= 0; _nl--)
-                     if(levels.Get(_nl) < hTrigger - levelBuf) { nextLevel = levels.Get(_nl); break; }
-                  if(nextLevel > 0 && current <= nextLevel + levelBuf)
-                  {
-                     LogEx(LOG_INFO, StringFormat("Hedge: prezzo %.2f raggiunge livello successivo %.2f — chiudo tutto", current, nextLevel), "HEDGE");
-                     if(PositionSelectByTicket(m_states[_hsi].hedgeTicket))
-                     {
-                        CTrade _ct; _ct.SetExpertMagicNumber(InpMagicNumber);
-                        _ct.PositionClose(m_states[_hsi].hedgeTicket);
-                     }
-                     else if(OrderSelect(m_states[_hsi].hedgeTicket))
-                        CancelHedgeOrder(m_states[_hsi].hedgeTicket);
-                     m_states[_hsi].hedgeTicket = 0;
-                     CTrade _ct2; _ct2.SetExpertMagicNumber(InpMagicNumber);
-                     _ct2.PositionClose(ticket);
-                  }
-               }
-            }
-         }
-      }
    }
 }
 
